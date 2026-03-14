@@ -464,15 +464,18 @@ async def liquidity_ok(session: aiohttp.ClientSession, token_id: str, price: flo
 
 # ─── Order execution ──────────────────────────────────────────────────────────
 def presign_order(client: ClobClient, market: Market, token_id: str, price: float):
-    """Build and EIP-712 sign the BUY order at T-40s so it's ready to POST at fire time."""
+    """Build and EIP-712 sign the BUY limit order at T-40s so it's ready to POST at fire time.
+    Uses GTC limit order at ask price — acts as taker if book has supply, else rests briefly.
+    """
     try:
-        mo = MarketOrderArgs(
-            token_id   = token_id,
-            amount     = STAKE,       # dollar amount to spend
-            side       = BUY,
-            price      = price,       # worst-case price floor
+        size = round(STAKE / price, 4)  # shares = dollars / price
+        order_args = OrderArgs(
+            token_id = token_id,
+            price    = price,
+            size     = size,
+            side     = BUY,
         )
-        return client.create_market_order(mo)
+        return client.create_order(order_args)
     except Exception as e:
         log.error(f"Presign error: {e}")
         return None
@@ -485,9 +488,9 @@ async def execute_buy(client: ClobClient, market: Market, token_id: str,
     if not order:
         return None
 
-    log.info(f"BUYING: BTC {side.upper()} ${STAKE:.2f} FAK @ floor={price:.4f}")
+    log.info(f"BUYING: BTC {side.upper()} ${STAKE:.2f} GTC limit @ {price:.4f}")
     try:
-        resp = await with_retry(lambda: client.post_order(order, OrderType.FAK), "buy_order")
+        resp = await with_retry(lambda: client.post_order(order, OrderType.GTC), "buy_order")
         log.info(f"  Buy response: {resp}")
         return resp
     except ExchangeDisabledError:
@@ -813,9 +816,9 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
                 _log_skip(state.market, side, price, "insufficient_funds", bal)
                 continue
 
-            # All gates passed — fire!
+            # All gates passed — fire and keep retrying until filled or window closes
             state.trade_fired = True
-            await _do_buy(client, session, state, side, token_id, price, bal)
+            await _do_buy(client, session, state, side, token_id, price, bal, time_left)
 
         elif time_left > ENTRY_WINDOW_SEC and int(time_left) % 10 == 0:
             # Waiting for entry window — log every 10s
@@ -824,35 +827,105 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             log.info(f"  T-{time_left}s | UP={ups[-1]:.3f} DOWN={dns[-1]:.3f}" if ups and dns else f"  T-{time_left}s | waiting for price ticks...")
 
 # ─── Trade actions ────────────────────────────────────────────────────────────
-async def _do_buy(client, session, state: BotState, side, token_id, price, bal_before):
-    resp = await execute_buy(client, state.market, token_id, side, price, state)
+async def _do_buy(client, session, state: BotState, side, token_id, price, bal_before, time_left=30):
+    """
+    Retry buy until filled, time runs out, or we hit MIN_FIRE_BUFFER.
+    - Attempt 1: immediately
+    - Attempts 2+: wait 1s between tries (safe rate: ~1 req/s, Polymarket limit is 10/s)
+    - Re-signs fresh order each attempt so signature is always valid
+    - Stops if time_left drops to MIN_FIRE_BUFFER or position filled
+    """
+    attempt = 0
+    deadline = time.time() + max(time_left - MIN_FIRE_BUFFER, 2)
 
-    # FAK: check size_matched to determine fill
-    size_matched = float(resp.get("size_matched", 0)) if resp else 0
-    log.info(f"  Buy resp: status={resp.get('status') if resp else 'None'} size_matched={size_matched}")
+    while time.time() < deadline:
+        attempt += 1
+        now_left = state.market.end_ts - int(time.time() + getattr(state, '_clock_offset', 0))
 
-    if not resp or size_matched == 0:
-        log.info("Buy unmatched — no fill.")
+        if now_left <= MIN_FIRE_BUFFER:
+            log.info(f"  Buy abort: only {now_left}s left, too close to close.")
+            break
+
+        # Re-sign fresh order each attempt (GTC orders need fresh signature)
+        order = presign_order(client, state.market, token_id, price)
+        if not order:
+            log.warning(f"  Attempt {attempt}: presign failed, retrying in 1s...")
+            await asyncio.sleep(1)
+            continue
+
+        log.info(f"  Buy attempt {attempt} @ T-{now_left}s price={price:.4f}")
+        try:
+            resp = client.post_order(order, OrderType.GTC)
+            size_matched = float(resp.get("size_matched", 0)) if resp else 0
+            status = resp.get("status", "") if resp else ""
+            log.info(f"  Attempt {attempt} resp: status={status} size_matched={size_matched}")
+
+            if size_matched > 0:
+                log.info(f"  ✅ FILLED on attempt {attempt}! size_matched={size_matched}")
+                # Fall through to position tracking below
+                break
+
+            # Rate limit: 1s between retries (well under Polymarket's 10 req/s limit)
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "too many" in err.lower():
+                log.warning(f"  Rate limited on attempt {attempt}, waiting 3s...")
+                await asyncio.sleep(3)
+            elif "order couldn" in err.lower() or "no orders found" in err.lower():
+                log.info(f"  Attempt {attempt}: no match yet, retrying in 1s...")
+                await asyncio.sleep(1)
+            elif "invalid signature" in err.lower():
+                log.warning(f"  Attempt {attempt}: signature error, re-signing...")
+                await asyncio.sleep(0.5)
+            else:
+                log.error(f"  Attempt {attempt} error: {e}")
+                await asyncio.sleep(1)
+        continue
+
+    # After retry loop — check if we got a fill
+    resp = None
+    try:
+        # Check open orders / last fill via balance change
+        size_matched = 0
+        # Re-read resp from last attempt if available (captured above)
+    except Exception:
+        size_matched = 0
+
+    # Final check: did balance change? (most reliable fill detection)
+    bal_after_attempt = get_balance(client)
+    filled_amount = bal_before - bal_after_attempt
+
+    if filled_amount > 0.01:  # balance dropped = money spent = filled
+        actual_price = price
+        shares = round(filled_amount / actual_price, 6)
+        log.info(f"✅ BUY CONFIRMED: spent=${filled_amount:.4f} shares={shares:.6f} @ {actual_price:.4f} after {attempt} attempt(s)")
+        state.position = Position(
+            side=side, token_id=token_id, entry_price=actual_price,
+            shares=shares, cycle_id=_cycle_id(),
+            market=state.market,
+        )
+        state.last_balance = bal_after_attempt
         save_trade(TradeRecord(
-            cycle_id=_cycle_id(), side=side, entry_price=price, exit_price=0,
-            shares_held=0, stake=STAKE, outcome="unmatched",
+            cycle_id=state.position.cycle_id, side=side,
+            entry_price=actual_price, exit_price=0,
+            shares_held=shares, stake=filled_amount, outcome="open",
             payout=0, gross_profit=0, fee_usdc=0, net_profit=0,
-            balance_before=bal_before, balance_after=bal_before,
+            balance_before=bal_before, balance_after=bal_after_attempt,
             market_slug=state.market.slug, timestamp=_ts(),
         ))
         return
 
-    shares = STAKE / price  # shares received = dollars spent / price per share
-    log.info(f"Buy filled! Holding {shares:.6f} shares of BTC {side.upper()}")
-
-    state.position = Position(
-        token_id    = token_id,
-        side        = side,
-        entry_price = price,
-        shares      = shares,
-        cycle_id    = _cycle_id(),
-        market      = state.market,
-    )
+    log.info(f"Buy unmatched after {attempt} attempt(s) — no fill.")
+    save_trade(TradeRecord(
+        cycle_id=_cycle_id(), side=side, entry_price=price, exit_price=0,
+        shares_held=0, stake=STAKE, outcome="unmatched",
+        payout=0, gross_profit=0, fee_usdc=0, net_profit=0,
+        balance_before=bal_before, balance_after=bal_before,
+        market_slug=state.market.slug, timestamp=_ts(),
+    ))
+    return
 
 async def _resolve_position(client: ClobClient, state: BotState):
     """Called when WSS market_resolved arrives. Determines win/loss."""
@@ -920,6 +993,13 @@ def _log_skip(market, side, price, reason, balance):
 
 async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, state: BotState):
     """Reset state and move to next 5-minute window."""
+    # Cancel any open GTC orders so they don't linger into next cycle
+    try:
+        client.cancel_all()
+        log.info("[ADVANCE] Cancelled open orders.")
+    except Exception as e:
+        log.warning(f"[ADVANCE] Cancel orders: {e}")
+
     server_ts = int(client.get_server_time())
     state.trade_fired      = False
     state.resolved         = None
