@@ -939,13 +939,46 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
     ))
     return
 
+async def _auto_redeem(client: ClobClient, token_id: str):
+    """
+    Trigger on-chain redemption of winning conditional tokens → USDC.
+    Polymarket does not auto-credit USDC on a win; we must call
+    update_balance_allowance(CONDITIONAL, token_id) to flush the payout.
+    Retries up to 3 times with a short back-off in case the oracle hasn't
+    settled yet at the moment market_resolved fires.
+    """
+    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+    for attempt in range(1, 4):
+        try:
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=1,
+            )
+            resp = client.update_balance_allowance(params=params)
+            log.info(f"[REDEEM] ✅ Redemption triggered (attempt {attempt}): {resp}")
+            return True
+        except Exception as e:
+            log.warning(f"[REDEEM] Attempt {attempt} failed: {e}")
+            if attempt < 3:
+                await asyncio.sleep(5 * attempt)  # 5s, 10s back-off
+    log.warning("[REDEEM] All redemption attempts failed — USDC may settle automatically within a few minutes.")
+    return False
+
 async def _resolve_position(client: ClobClient, state: BotState):
-    """Called when WSS market_resolved arrives. Determines win/loss."""
+    """Called when WSS market_resolved arrives. Determines win/loss and redeems if won."""
     pos  = state.position
     won  = (state.resolved == pos.token_id)
     outcome = "win" if won else "loss"
     fee_bps = float(state.market.fee_rate or 0)
     payout, gross, fee_usdc, net = calc_profit(STAKE, pos.entry_price, 1.0, fee_bps, outcome)
+
+    # ── Auto-redeem winning tokens → USDC ─────────────────────────────────────
+    if won:
+        log.info(f"[REDEEM] WIN detected — redeeming conditional tokens for {pos.token_id[:20]}...")
+        redeemed = await _auto_redeem(client, pos.token_id)
+        # Wait a moment for the on-chain settlement to propagate before reading balance
+        await asyncio.sleep(3 if redeemed else 1)
 
     bal_after = get_balance(client)
     state.last_balance = bal_after
@@ -1022,13 +1055,21 @@ async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, st
 
     if state.next_market:
         m = await _gamma_slug(session, state.next_market.slug)
-        if m and m.end_ts > server_ts:  # validate end_ts is in the future
+        # Only use the queued market if it ends within the next two candle windows (~10 min).
+        # If end_ts is far in the future (e.g. a wrong slug queued hours ahead), discard it
+        # and fall through to fetch_btc_market to find the correct next 5-min window.
+        MAX_ADVANCE_SECONDS = 700  # ~2 candle windows (10 min + buffer)
+        if m and server_ts < m.end_ts <= server_ts + MAX_ADVANCE_SECONDS:
             state.market      = enrich_market(client, m)
             state.next_market = None
             log.info(f"[ADVANCE] Loaded queued market: {m.slug} | ends in {m.end_ts - server_ts}s")
             return
         else:
-            log.warning(f"[ADVANCE] Queued market invalid or expired, scanning fresh...")
+            if m:
+                log.warning(f"[ADVANCE] Queued market {state.next_market.slug} end_ts too far "
+                            f"({m.end_ts - server_ts}s away) — discarding and scanning fresh...")
+            else:
+                log.warning(f"[ADVANCE] Queued market invalid or expired, scanning fresh...")
             state.next_market = None
 
     m = await fetch_btc_market(session, server_ts)
