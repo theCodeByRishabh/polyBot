@@ -55,7 +55,7 @@ WSS_MARKET      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CHAIN_ID        = 137
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-STAKE             = 1.00    # Fixed $1.00 per trade
+STAKE             = 5.00    # Fixed $5.00 per trade (min 5 shares at 0.93+ price)
 BASE_THRESHOLD    = 0.93    # Buy when dominant side ask >= 93%
 ADAPTIVE_THRESH   = 0.97    # Raised after 2 consecutive losses
 ENTRY_WINDOW_SEC  = 30      # Enter any time price >= threshold AND <=30s remain
@@ -468,7 +468,11 @@ def presign_order(client: ClobClient, market: Market, token_id: str, price: floa
     Uses GTC limit order at ask price — acts as taker if book has supply, else rests briefly.
     """
     try:
-        size = round(STAKE / price, 4)  # shares = dollars / price
+        import math
+        raw_size = STAKE / price
+        size = math.ceil(raw_size * 100) / 100  # round UP to 2 decimal places
+        size = max(size, 5.0)  # enforce minimum 5 shares
+        log.info(f"  Order size: {size} shares @ {price} (${size*price:.4f})")
         order_args = OrderArgs(
             token_id = token_id,
             price    = price,
@@ -1042,7 +1046,7 @@ async def run_bot():
         loop.add_signal_handler(sig, stop.set)
 
     log.info("=" * 65)
-    log.info(" Polymarket BTC 5m Bot v5  —  $1 fixed | Entry window 30s")
+    log.info(" Polymarket BTC 5m Bot v5  —  $5 fixed | Entry window 30s")
     log.info(f" Buy: >= {BASE_THRESHOLD*100:.0f}% (adaptive {ADAPTIVE_THRESH*100:.0f}% after 2 losses)")
     log.info(f" Stop-loss: sell if bid < {STOP_LOSS_BID*100:.0f}% AND > {STOP_LOSS_MIN_SEC}s remain")
     log.info(f" Filters: spread<{MAX_SPREAD} | liq>${MIN_LIQUIDITY} | vol-momentum | presign@T-{PRESIGN_BEFORE}s")
