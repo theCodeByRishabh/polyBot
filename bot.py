@@ -554,7 +554,7 @@ async def run_market_wss(state: BotState, client: ClobClient,
         # Ensure token IDs are clean strings (not lists or bracket-wrapped)
         def _clean_id(tid):
             if isinstance(tid, list): tid = tid[0] if tid else ""
-            return str(tid).strip().strip("[]"'")
+            return str(tid).strip().strip("[]\"' ")
         up_id_clean   = _clean_id(state.market.up_token_id)
         down_id_clean = _clean_id(state.market.down_token_id)
         state.market.up_token_id   = up_id_clean
