@@ -220,12 +220,18 @@ async def with_retry(fn, label: str, max_tries: int = 6):
 
 # ─── Heartbeat ────────────────────────────────────────────────────────────────
 async def heartbeat_loop(client: ClobClient, state: BotState, stop: asyncio.Event):
+    state.heartbeat_id = ""  # Always start fresh — let server assign first ID
     while not stop.is_set():
         try:
             resp = client.post_heartbeat(state.heartbeat_id)
-            state.heartbeat_id = resp.get("heartbeat_id", "")
+            new_id = resp.get("heartbeat_id", "")
+            if new_id:
+                state.heartbeat_id = new_id
         except Exception as e:
-            log.warning(f"Heartbeat error: {e}")
+            if "Invalid Heartbeat ID" in str(e):
+                state.heartbeat_id = ""  # Reset so next call gets a fresh one
+            else:
+                log.warning(f"Heartbeat error: {e}")
         await asyncio.sleep(5)
 
 # ─── Market discovery ─────────────────────────────────────────────────────────
@@ -665,7 +671,7 @@ async def run_market_wss(state: BotState, client: ClobClient,
                             state.resolved = msg.get("winning_asset_id","")
                             log.info(f"[WSS] Market resolved: winner={state.resolved[:20]}...")
 
-                        elif etype:
+                        elif etype and etype not in ("book",):
                             log.info(f"[WSS] unhandled event: {etype}")
 
                 ping_t.cancel()
