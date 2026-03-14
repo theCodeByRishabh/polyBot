@@ -303,7 +303,10 @@ async def _gamma_slug(session: aiohttp.ClientSession, slug: str, end_ts_override
                     tokens = m.get("tokens", [])
                     clob_ids = m.get("clobTokenIds", [])
                     outcomes = m.get("outcomes", "").split(",") if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
-                    log.info(f"[GAMMA] market raw — tokens={len(tokens)} clobTokenIds={clob_ids} outcomes={outcomes}")
+                    # Dump ALL keys so we can see what's actually there
+                    log.info(f"[GAMMA] market keys: {list(m.keys())}")
+                    log.info(f"[GAMMA] market raw — tokens={tokens} clobTokenIds={clob_ids} outcomes={outcomes}")
+                    log.info(f"[GAMMA] outcomePrices={m.get('outcomePrices')} conditionId={m.get('conditionId','')[:16]}")
                     if len(clob_ids) >= 2:
                         # outcomes order: index 0 = first outcome
                         outcome_list = [o.strip() for o in outcomes]
