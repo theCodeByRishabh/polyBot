@@ -230,21 +230,26 @@ async def heartbeat_loop(client: ClobClient, state: BotState, stop: asyncio.Even
 
 # ─── Market discovery ─────────────────────────────────────────────────────────
 async def fetch_btc_market(session: aiohttp.ClientSession, server_ts: int) -> Optional[Market]:
+    # Polymarket slug uses WINDOW START timestamp (not end)
+    # e.g. btc-updown-5m-1773515100 = window that STARTS at 1773515100, ends at 1773515400
     log.info(f"[MARKET SCAN] server_ts={server_ts} | searching for next BTC 5m market...")
-    for offset in [300, 0, 600]:
-        end_ts = ((server_ts // 300) * 300) + offset
-        if end_ts <= server_ts + ENTRY_WINDOW_SEC + 2:
-            log.info(f"[MARKET SCAN] slug btc-updown-5m-{end_ts} skipped (only {end_ts - server_ts}s left, need >{ENTRY_WINDOW_SEC+2}s)")
+    current_window_start = (server_ts // 300) * 300
+    # Try current window and next 2 windows
+    for start_ts in [current_window_start, current_window_start + 300, current_window_start + 600]:
+        end_ts = start_ts + 300  # window ends 5 min after start
+        time_left = end_ts - server_ts
+        if time_left <= ENTRY_WINDOW_SEC + 2:
+            log.info(f"[MARKET SCAN] slug btc-updown-5m-{start_ts} skipped (only {time_left}s left, need >{ENTRY_WINDOW_SEC+2}s)")
             continue
-        slug = f"btc-updown-5m-{end_ts}"
-        log.info(f"[MARKET SCAN] trying slug: {slug} ({end_ts - server_ts}s remaining)")
-        m = await _gamma_slug(session, slug)
+        slug = f"btc-updown-5m-{start_ts}"
+        log.info(f"[MARKET SCAN] trying slug: {slug} ({time_left}s until close)")
+        m = await _gamma_slug(session, slug, end_ts_override=end_ts)
         if m:
-            log.info(f"[MARKET SCAN] ✅ found market: {slug}")
+            log.info(f"[MARKET SCAN] ✅ found market: {slug} | closes in {time_left}s")
             return m
         else:
             log.info(f"[MARKET SCAN] ❌ not found: {slug}")
-    log.warning("[MARKET SCAN] no market found — will retry in trading loop")
+    log.warning("[MARKET SCAN] no market found — will retry in 15s")
     return None
 
 GAMMA_HEADERS = {
@@ -254,7 +259,7 @@ GAMMA_HEADERS = {
     "Referer": "https://polymarket.com/",
 }
 
-async def _gamma_slug(session: aiohttp.ClientSession, slug: str) -> Optional[Market]:
+async def _gamma_slug(session: aiohttp.ClientSession, slug: str, end_ts_override: int = 0) -> Optional[Market]:
     try:
         async with session.get(f"{GAMMA_API}/markets", params={"slug": slug},
                                headers=GAMMA_HEADERS,
@@ -268,10 +273,18 @@ async def _gamma_slug(session: aiohttp.ClientSession, slug: str) -> Optional[Mar
             tokens = raw.get("tokens", [])
             up     = next((t for t in tokens if t["outcome"].lower() == "up"),   None)
             down   = next((t for t in tokens if t["outcome"].lower() == "down"), None)
-            if not up or not down: return None
-            end_dt = datetime.fromisoformat(raw["endDate"].replace("Z", "+00:00"))
+            if not up or not down:
+                log.warning(f"[GAMMA] {slug} → missing UP/DOWN tokens. outcomes={[t.get('outcome') for t in tokens]}")
+                return None
+            # Use endDate from API, fallback to override if needed
+            try:
+                end_dt = datetime.fromisoformat(raw["endDate"].replace("Z", "+00:00"))
+                end_ts = int(end_dt.timestamp())
+            except Exception:
+                end_ts = end_ts_override
+            log.info(f"[GAMMA] {slug} → end_ts={end_ts} up={up['token_id'][:12]}... down={down['token_id'][:12]}...")
             return Market(
-                slug=raw["slug"], end_ts=int(end_dt.timestamp()),
+                slug=raw["slug"], end_ts=end_ts,
                 up_token_id=up["token_id"], down_token_id=down["token_id"],
                 condition_id=raw.get("conditionId",""), neg_risk=raw.get("negRisk",False),
             )
