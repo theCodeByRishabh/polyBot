@@ -726,8 +726,8 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
         server_ts = int(now_local + getattr(state, '_clock_offset', 0.0))
         time_left = state.market.end_ts - server_ts
 
-        # Log status every 10s
-        if int(time_left) % 10 == 0:
+        # Log status every 5s
+        if int(time_left) % 5 == 0:
             ups = [t.best_ask for t in state.price_history if t.token_id == state.market.up_token_id]
             dns = [t.best_ask for t in state.price_history if t.token_id == state.market.down_token_id]
             tick_count = len(state.price_history)
