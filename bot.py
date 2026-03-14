@@ -466,15 +466,13 @@ async def liquidity_ok(session: aiohttp.ClientSession, token_id: str, price: flo
 def presign_order(client: ClobClient, market: Market, token_id: str, price: float):
     """Build and EIP-712 sign the BUY order at T-40s so it's ready to POST at fire time."""
     try:
-        # size = number of shares = dollar amount / price
-        size = round(STAKE / price, 4)
-        order_args = OrderArgs(
-            token_id = token_id,
-            price    = price,
-            size     = size,
-            side     = BUY,
+        mo = MarketOrderArgs(
+            token_id   = token_id,
+            amount     = STAKE,       # dollar amount to spend
+            side       = BUY,
+            price      = price,       # worst-case price floor
         )
-        return client.create_order(order_args)
+        return client.create_market_order(mo)
     except Exception as e:
         log.error(f"Presign error: {e}")
         return None
@@ -513,13 +511,13 @@ async def execute_sell(client: ClobClient, market: Market, position: Position,
     floor = max(exit_price - 0.02, 0.01)
     log.info(f"STOP-LOSS SELL: {position.shares:.6f} shares @ floor={floor:.4f}")
     try:
-        order_args = OrderArgs(
+        mo = MarketOrderArgs(
             token_id = position.token_id,
-            price    = floor,
-            size     = position.shares,
+            amount   = position.shares,
             side     = SELL,
+            price    = floor,
         )
-        order = client.create_order(order_args)
+        order = client.create_market_order(mo)
         resp = client.post_order(order, OrderType.FAK)  # FAK: fill what we can, cancel rest
         log.info(f"  Sell response: {resp}")
         return resp
