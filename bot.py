@@ -973,31 +973,123 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
     ))
     return
 
-async def _auto_redeem(client: ClobClient, token_id: str):
+async def _auto_redeem(condition_id: str) -> bool:
     """
-    Trigger on-chain redemption of winning conditional tokens → USDC.
-    Polymarket does not auto-credit USDC on a win; we must call
-    update_balance_allowance(CONDITIONAL, token_id) to flush the payout.
-    Retries up to 3 times with a short back-off in case the oracle hasn't
-    settled yet at the moment market_resolved fires.
+    Redeem winning conditional tokens back to USDC via the Builder Relayer.
+
+    Requires three env vars set in .env:
+        BUILDER_KEY        - your Builder API key
+        BUILDER_SECRET     - your Builder secret
+        BUILDER_PASSPHRASE - your Builder passphrase
+
+    These come from your Polymarket Builder account. The bot uses a Proxy
+    wallet (signature_type=1), so we use RelayerTxType.PROXY.
+
+    Contract addresses (Polygon mainnet):
+        CTF:  0x4d97dcd97ec945f40cf65f87097ace5ea0476045
+        USDC: 0x2791bca1f2de4661ed88a30c99a7a9449aa84174
+
+    parentCollectionId must be bytes32(0) for CLOB tokens (not NegRisk Adapter).
+    indexSets = [1, 2] redeems both outcome slots at once.
+
+    redeemPositions selector: keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+    = 0x9e2e3d85
     """
-    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+    builder_key        = os.environ.get("BUILDER_KEY", "")
+    builder_secret     = os.environ.get("BUILDER_SECRET", "")
+    builder_passphrase = os.environ.get("BUILDER_PASSPHRASE", "")
+
+    if not all([builder_key, builder_secret, builder_passphrase]):
+        log.warning(
+            "[REDEEM] Builder credentials missing (BUILDER_KEY / BUILDER_SECRET / "
+            "BUILDER_PASSPHRASE). Win will settle on-chain automatically within ~5 min. "
+            "Add credentials to .env to enable instant auto-redeem."
+        )
+        return False
+
+    try:
+        from py_builder_relayer_client.client import RelayClient
+        from py_builder_relayer_client.types import OperationType, RelayerTxType
+        from py_builder_signing_sdk.config import BuilderConfig
+        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+        from eth_abi import encode as abi_encode
+    except ImportError as exc:
+        log.warning(f"[REDEEM] Missing package ({exc}). Run: pip install py-builder-relayer-client eth-abi")
+        return False
+
+    CTF_ADDRESS   = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
+    USDC_ADDRESS  = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
+    RELAYER_URL   = "https://relayer-v2.polymarket.com/"
+    # redeemPositions(address,bytes32,bytes32,uint256[]) selector
+    SELECTOR_HEX  = "9e2e3d85"
+    PARENT_ZERO   = "0x" + "00" * 32
+    INDEX_SETS    = [1, 2]
+
+    # Normalise condition_id to 0x-prefixed 32-byte hex
+    cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
+    if len(cid) != 66:
+        log.error(f"[REDEEM] Invalid condition_id length ({len(cid)} chars, expected 66): {cid}")
+        return False
+
+    try:
+        cid_bytes    = bytes.fromhex(cid[2:])
+        parent_bytes = bytes(32)
+        params_hex   = abi_encode(
+            ["address", "bytes32", "bytes32", "uint256[]"],
+            [USDC_ADDRESS, parent_bytes, cid_bytes, INDEX_SETS],
+        ).hex()
+        calldata = "0x" + SELECTOR_HEX + params_hex
+    except Exception as exc:
+        log.error(f"[REDEEM] ABI encoding failed: {exc}")
+        return False
+
+    tx = {
+        "to":        CTF_ADDRESS,
+        "data":      calldata,
+        "value":     "0",
+        "operation": OperationType.Call,
+    }
+
+    try:
+        builder_cfg = BuilderConfig(
+            local_builder_creds=BuilderApiKeyCreds(
+                key=builder_key,
+                secret=builder_secret,
+                passphrase=builder_passphrase,
+            )
+        )
+        # Proxy wallet = signature_type 1 → RelayerTxType.PROXY
+        relay = RelayClient(
+            RELAYER_URL,
+            CHAIN_ID,
+            PRIVATE_KEY,
+            builder_cfg,
+            RelayerTxType.PROXY,
+        )
+    except Exception as exc:
+        log.error(f"[REDEEM] RelayClient init failed: {exc}")
+        return False
+
     for attempt in range(1, 4):
         try:
-            params = BalanceAllowanceParams(
-                asset_type=AssetType.CONDITIONAL,
-                token_id=token_id,
-                signature_type=1,
-            )
-            resp = client.update_balance_allowance(params=params)
-            log.info(f"[REDEEM] ✅ Redemption triggered (attempt {attempt}): {resp}")
-            return True
-        except Exception as e:
-            log.warning(f"[REDEEM] Attempt {attempt} failed: {e}")
+            log.info(f"[REDEEM] Submitting redeemPositions via relayer (attempt {attempt}/3)...")
+            resp    = relay.execute([tx], f"auto-redeem condition {cid[:18]}...")
+            receipt = resp.wait()
+            state_val = getattr(receipt, "state", None) if receipt else None
+            # Accept both mined and confirmed states
+            if state_val in ("STATE_MINED", "STATE_CONFIRMED", 3, 4):
+                log.info(f"[REDEEM] Redemption confirmed on-chain (state={state_val}) ✅")
+                return True
+            log.warning(f"[REDEEM] Attempt {attempt} finished with state={state_val} — retrying in 10s...")
+            await asyncio.sleep(10)
+        except Exception as exc:
+            log.warning(f"[REDEEM] Attempt {attempt} error: {exc}")
             if attempt < 3:
-                await asyncio.sleep(5 * attempt)  # 5s, 10s back-off
-    log.warning("[REDEEM] All redemption attempts failed — USDC may settle automatically within a few minutes.")
+                await asyncio.sleep(10)
+
+    log.warning("[REDEEM] All relayer attempts failed. Win settles automatically within ~5 min.")
     return False
+
 
 async def _resolve_position(client: ClobClient, state: BotState):
     """Called when WSS market_resolved arrives. Determines win/loss and redeems if won."""
@@ -1007,32 +1099,21 @@ async def _resolve_position(client: ClobClient, state: BotState):
     fee_bps = float(state.market.fee_rate or 0)
     payout, gross, fee_usdc, net = calc_profit(STAKE, pos.entry_price, 1.0, fee_bps, outcome)
 
-    # ── Auto-redeem winning tokens → USDC ─────────────────────────────────────
     if won:
-        log.info(f"[REDEEM] WIN detected — redeeming conditional tokens for {pos.token_id[:20]}...")
-        redeemed = await _auto_redeem(client, pos.token_id)
-        # Wait a moment for the on-chain settlement to propagate before reading balance
-        await asyncio.sleep(3 if redeemed else 1)
+        cid = pos.market.condition_id
+        if cid:
+            log.info(f"[REDEEM] WIN — auto-redeeming condition_id={cid[:20]}...")
+            await asyncio.sleep(5)          # let oracle fully settle before redeem call
+            await _auto_redeem(cid)
+            await asyncio.sleep(5)          # let balance propagate before reading it
+        else:
+            log.warning("[REDEEM] WIN but condition_id is empty — cannot auto-redeem. Claim manually.")
 
     bal_after = get_balance(client)
     state.last_balance = bal_after
     state.consecutive_losses = 0 if won else state.consecutive_losses + 1
 
     log.info(f"{'WIN' if won else 'LOSS'}: gross={gross:+.4f} fee={fee_usdc:.5f} net={net:+.4f} | balance=${bal_after:.4f}")
-    save_trade(TradeRecord(
-        cycle_id=pos.cycle_id, side=pos.side, entry_price=pos.entry_price,
-        exit_price=0, shares_held=pos.shares, stake=STAKE,
-        outcome=outcome, payout=payout, gross_profit=gross,
-        fee_usdc=fee_usdc, net_profit=net,
-        balance_before=state.last_balance, balance_after=bal_after,
-        market_slug=pos.market.slug, timestamp=_ts(),
-    ))
-
-    if bal_after < STAKE:
-        log.warning(f"Balance ${bal_after:.4f} is below stake. Top up to resume trading.")
-
-    state.position = None
-
 async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
                         state: BotState, exit_bid: float):
     """Execute a stop-loss SELL when price crashes below 60%."""
