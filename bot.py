@@ -1023,183 +1023,149 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
 
 async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> bool:
     """
-    Redeem winning conditional tokens → USDC via the Polymarket Relayer.
+    Redeem winning conditional tokens → USDC.
 
-    Uses RELAYER_API_KEY + RELAYER_API_KEY_ADDRESS (the keys shown in your
-    Settings → Relayer API Keys page) — NO Builder credentials needed.
+    Requires Builder credentials from polymarket.com/settings?tab=builder:
+        BUILDER_KEY        = apiKey  (019cee25-... style)
+        BUILDER_SECRET     = secret  (2UOwKs0L... style)
+        BUILDER_PASSPHRASE = passphrase (b01dac48... style)
 
-    Flow:
-      1. GET /relay-payload?address=<EOA>&type=PROXY → {address: relayerAddr, nonce}
-      2. Build redeemPositions calldata (redeemPositions on CTF contract)
-      3. Build EIP-712 struct hash per UserProxy contract typehash
-      4. Sign with private key using eth_account
-      5. POST /submit  with RELAYER_API_KEY + RELAYER_API_KEY_ADDRESS headers
+    These are separate from RELAYER_API_KEY — they come from the "Builder Codes"
+    tab in Polymarket settings. The relayer requires them to submit PROXY
+    transactions on your behalf.
 
-    UserProxy contract (Polygon):
-        EXEC_TX_TYPEHASH = keccak256(
-            "ExecTransaction(address to,uint256 value,bytes data,uint8 operation,uint256 nonce)"
-        )
-        Hash = keccak256(abi.encode(
-            EXEC_TX_TYPEHASH, to, value, keccak256(data), operation, nonce
-        ))
-        Final = keccak256(abi.encodePacked(
-            bytes1(0x19), bytes1(0x01), DOMAIN_SEPARATOR, structHash
-        ))
+    Uses poly-web3 + py-builder-relayer-client (installed via requirements.txt /
+    Dockerfile). Falls back to a clear error message if packages are missing.
     """
     import json as _json
-    import struct as _struct
 
-    relayer_api_key     = os.environ.get("RELAYER_API_KEY", "")
-    relayer_key_address = os.environ.get("RELAYER_API_KEY_ADDRESS", "")
+    builder_key        = os.environ.get("BUILDER_KEY", "")
+    builder_secret     = os.environ.get("BUILDER_SECRET", "")
+    builder_passphrase = os.environ.get("BUILDER_PASSPHRASE", "")
 
-    if not all([relayer_api_key, relayer_key_address]):
+    if not all([builder_key, builder_secret, builder_passphrase]):
         log.warning(
-            "[REDEEM] RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS not set. "
-            "Win settles on-chain automatically within ~5 min. "
-            "Add these from Settings → Relayer API Keys to enable instant auto-redeem."
+            "[REDEEM] BUILDER_KEY / BUILDER_SECRET / BUILDER_PASSPHRASE not set. "
+            "Get them from polymarket.com/settings?tab=builder → Builder Codes. "
+            "Win will settle on-chain automatically within ~5 min."
         )
         return False
 
-    RELAYER_URL  = "https://relayer-v2.polymarket.com"
-    CTF_ADDRESS  = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
-    USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    FUNDER       = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
-
-    # Normalise condition_id
     cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
     if len(cid) != 66:
-        log.error(f"[REDEEM] Invalid condition_id length: {cid}")
+        log.error(f"[REDEEM] Invalid condition_id: {cid}")
         return False
 
-    # ── Build redeemPositions calldata ────────────────────────────────────
-    # selector = keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
-    SELECTOR    = "9e2e3d85"
-    usdc_padded = USDC_ADDRESS.lower().replace("0x", "").zfill(64)
-    parent_zero = "00" * 32
-    cid_padded  = cid[2:].lower().zfill(64)
-    arr_offset  = "00" * 31 + "80"   # offset to array = 128 bytes
-    arr_len     = "00" * 31 + "02"   # length = 2
-    idx_1       = "00" * 31 + "01"   # indexSet 1
-    idx_2       = "00" * 31 + "02"   # indexSet 2
-    calldata    = bytes.fromhex(
-        SELECTOR + usdc_padded + parent_zero + cid_padded
-        + arr_offset + arr_len + idx_1 + idx_2
-    )
-
+    # ── Strategy A: poly-web3 (the only verified working Python implementation) ──
     try:
-        from eth_account import Account
-        from eth_utils import keccak
-        from eth_abi import encode as abi_encode
-    except ImportError as exc:
-        log.error(f"[REDEEM] Missing dependency: {exc}")
-        return False
+        from py_builder_relayer_client.client import RelayClient
+        from py_builder_signing_sdk.config import BuilderConfig
+        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+        from poly_web3 import RELAYER_URL as POLY_RELAYER_URL, PolyWeb3Service
 
-    account = Account.from_key(PRIVATE_KEY)
-    eoa     = account.address   # signer / from address
+        FUNDER = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
+        builder_cfg = BuilderConfig(
+            local_builder_creds=BuilderApiKeyCreds(
+                key=builder_key,
+                secret=builder_secret,
+                passphrase=builder_passphrase,
+            )
+        )
+        relay_client = RelayClient(
+            POLY_RELAYER_URL,
+            CHAIN_ID,
+            PRIVATE_KEY,       # EOA private key — RelayClient signs with this
+            builder_cfg,
+        )
 
-    for attempt in range(1, 4):
-        try:
-            # ── Step 1: get relay address + nonce ─────────────────────────
-            async with session.get(
-                f"{RELAYER_URL}/relay-payload",
-                params={"address": eoa, "type": "PROXY"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                rp = await r.json()
-            relay_addr = rp["address"]   # relayer's address
-            nonce      = int(rp["nonce"])
-            log.info(f"[REDEEM] relay_addr={relay_addr} nonce={nonce}")
+        # Re-use the existing ClobClient for service init (it has right creds)
+        # We need a fresh one since we're outside the trading_loop scope
+        from py_clob_client.client import ClobClient as _ClobClient
+        _tmp_client = _ClobClient(
+            CLOB_HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
+            signature_type=1, funder=FUNDER,
+        )
+        _tmp_client.set_api_creds(_tmp_client.create_or_derive_api_creds())
 
-            # ── Step 2: fetch domain separator for the proxy wallet ────────
-            # The proxy wallet's DOMAIN_SEPARATOR is stored at DOMAIN_SLOT.
-            # We fetch it via eth_getStorageAt on the funder (proxy) address.
-            # DOMAIN_SLOT = bytes32(uint256(keccak256('eip1967.proxy.domain')) - 1)
-            #             = 0x5d29634e15c15fa29be556decae8ee5a34c9fee5f209623aed08a64bf865b694
-            DOMAIN_SLOT = "0x5d29634e15c15fa29be556decae8ee5a34c9fee5f209623aed08a64bf865b694"
-            RPC_URL = os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com")
+        service = PolyWeb3Service(clob_client=_tmp_client, relayer_client=relay_client)
+
+        log.info(f"[REDEEM] Calling poly_web3 service.redeem({cid[:20]}...)...")
+        result = service.redeem(condition_id=cid)
+        log.info(f"[REDEEM] ✅ Result: {result}")
+
+        state = (result or {}).get("state", "")
+        if state in ("STATE_CONFIRMED", "STATE_MINED", "STATE_EXECUTED", ""):
+            log.info(f"[REDEEM] ✅ Redemption submitted (state={state or 'submitted'})")
+            return True
+        else:
+            log.warning(f"[REDEEM] Unexpected state: {state}")
+            return False
+
+    except ImportError:
+        log.warning("[REDEEM] poly-web3 / py-builder-relayer-client not installed. "
+                    "Add them to requirements.txt and rebuild the container.")
+        pass
+    except Exception as exc:
+        log.warning(f"[REDEEM] poly-web3 redeem failed: {exc}")
+
+    # ── Strategy B: direct REST call to /submit (Builder API key auth) ──────────
+    # Only reached if poly-web3 raised an unexpected exception.
+    # Uses HMAC auth via py_builder_signing_sdk (already installed).
+    try:
+        from py_builder_signing_sdk.signing.hmac import build_hmac_signature
+
+        CTF_ADDRESS  = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
+        USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        RELAYER_URL  = "https://relayer-v2.polymarket.com"
+
+        # Manual ABI encode: redeemPositions(address,bytes32,bytes32,uint256[])
+        SELECTOR    = "9e2e3d85"
+        usdc_padded = USDC_ADDRESS.lower().replace("0x","").zfill(64)
+        parent_zero = "00" * 32
+        cid_padded  = cid[2:].lower().zfill(64)
+        arr_offset  = "00" * 31 + "80"
+        arr_len     = "00" * 31 + "02"
+        idx_1       = "00" * 31 + "01"
+        idx_2       = "00" * 31 + "02"
+        calldata    = ("0x" + SELECTOR + usdc_padded + parent_zero
+                       + cid_padded + arr_offset + arr_len + idx_1 + idx_2)
+
+        body_obj = {
+            "transactions": [{"to": CTF_ADDRESS, "data": calldata, "value": "0"}],
+            "metadata": f"auto-redeem {cid[:18]}",
+        }
+        body_str  = _json.dumps(body_obj, separators=(",", ":"))
+        path      = "/execute/proxy"
+        timestamp = str(int(time.time()))
+        signature = build_hmac_signature(
+            builder_secret, timestamp, "POST", path, body_str
+        )
+        headers = {
+            "Content-Type":           "application/json",
+            "POLY_BUILDER_API_KEY":    builder_key,
+            "POLY_BUILDER_TIMESTAMP":  timestamp,
+            "POLY_BUILDER_PASSPHRASE": builder_passphrase,
+            "POLY_BUILDER_SIGNATURE":  signature,
+        }
+
+        for attempt in range(1, 4):
+            log.info(f"[REDEEM] Strategy B: POST {RELAYER_URL}{path} (attempt {attempt}/3)...")
             async with session.post(
-                RPC_URL,
-                json={"jsonrpc": "2.0", "method": "eth_getStorageAt",
-                      "params": [FUNDER, DOMAIN_SLOT, "latest"], "id": 1},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                rpc_resp = await r.json()
-            domain_sep = bytes.fromhex(rpc_resp["result"][2:])  # 32 bytes
-
-            # ── Step 3: build EIP-712 struct hash ─────────────────────────
-            # EXEC_TX_TYPEHASH = keccak256(
-            #   "ExecTransaction(address to,uint256 value,bytes data,uint8 operation,uint256 nonce)"
-            # ) = 0xa609e999e2804ed92314c0c662cfdb3c1d8107df2fb6f2e4039093f20d5e6250
-            EXEC_TX_TYPEHASH = bytes.fromhex(
-                "a609e999e2804ed92314c0c662cfdb3c1d8107df2fb6f2e4039093f20d5e6250"
-            )
-
-            # to (address → padded 32), value=0, keccak256(data), operation=0, nonce
-            to_padded  = bytes.fromhex(CTF_ADDRESS[2:].lower().zfill(64))
-            value_zero = (0).to_bytes(32, "big")
-            data_hash  = keccak(calldata)
-            op_zero    = (0).to_bytes(32, "big")
-            nonce_enc  = nonce.to_bytes(32, "big")
-
-            struct_hash = keccak(
-                EXEC_TX_TYPEHASH
-                + to_padded
-                + value_zero
-                + data_hash
-                + op_zero
-                + nonce_enc
-            )
-
-            # Final EIP-191 / EIP-712 digest
-            digest = keccak(
-                b"\x19\x01" + domain_sep + struct_hash
-            )
-
-            # ── Step 4: sign ───────────────────────────────────────────────
-            sig = Account._sign_hash(digest, PRIVATE_KEY)
-            signature_hex = "0x" + sig.signature.hex()
-
-            # ── Step 5: POST /submit ───────────────────────────────────────
-            body = {
-                "from":        eoa,
-                "to":          CTF_ADDRESS,
-                "proxyWallet": FUNDER,
-                "data":        "0x" + calldata.hex(),
-                "nonce":       str(nonce),
-                "signature":   signature_hex,
-                "signatureParams": {
-                    "gasPrice":       "0",
-                    "operation":      "0",
-                    "safeTxnGas":     "0",
-                    "baseGas":        "0",
-                    "gasToken":       "0x0000000000000000000000000000000000000000",
-                    "refundReceiver": "0x0000000000000000000000000000000000000000",
-                },
-                "type": "PROXY",
-            }
-            headers = {
-                "Content-Type":          "application/json",
-                "RELAYER_API_KEY":        relayer_api_key,
-                "RELAYER_API_KEY_ADDRESS": relayer_key_address,
-            }
-            log.info(f"[REDEEM] POST /submit (attempt {attempt}/3)...")
-            async with session.post(
-                f"{RELAYER_URL}/submit",
-                data=_json.dumps(body),
+                f"{RELAYER_URL}{path}",
+                data=body_str,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp_text = await resp.text()
+                log.info(f"[REDEEM] HTTP {resp.status}: {resp_text[:200]}")
                 if resp.status not in (200, 201, 202):
-                    log.warning(f"[REDEEM] HTTP {resp.status}: {resp_text[:300]}")
                     await asyncio.sleep(10)
                     continue
                 resp_json = _json.loads(resp_text)
                 tx_id = resp_json.get("transactionID", "")
                 log.info(f"[REDEEM] Submitted tx_id={tx_id}")
 
-            # ── Poll for confirmation ──────────────────────────────────────
-            for poll in range(12):   # up to 60s
+            for poll in range(12):
                 await asyncio.sleep(5)
                 try:
                     async with session.get(
@@ -1214,18 +1180,16 @@ async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> boo
                         log.info(f"[REDEEM] ✅ Redeemed on-chain (state={state})")
                         return True
                     if state in ("STATE_FAILED", "STATE_INVALID"):
-                        log.error(f"[REDEEM] ❌ Transaction {state}")
+                        log.error(f"[REDEEM] ❌ {state}: {pd}")
                         break
                 except Exception as pe:
                     log.warning(f"[REDEEM] Poll error: {pe}")
-            break
+            return False
 
-        except Exception as exc:
-            log.warning(f"[REDEEM] Attempt {attempt} error: {exc}")
-            if attempt < 3:
-                await asyncio.sleep(10)
+    except Exception as exc:
+        log.error(f"[REDEEM] Strategy B also failed: {exc}")
 
-    log.warning("[REDEEM] All attempts done. Win settles automatically within ~5 min.")
+    log.warning("[REDEEM] All strategies failed. Win settles automatically within ~5 min.")
     return False
 
 
