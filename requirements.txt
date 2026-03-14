@@ -4,3 +4,4 @@ aiohttp>=3.9.0
 websockets>=12.0
 python-dotenv>=1.0.0
 eth-abi>=5.0.0
+poly-web3
