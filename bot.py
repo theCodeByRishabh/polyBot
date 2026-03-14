@@ -288,10 +288,24 @@ async def _gamma_slug(session: aiohttp.ClientSession, slug: str, end_ts_override
             log.info(f"[GAMMA] market keys: {sorted(m.keys())}")
 
             # Try every possible field that could hold token IDs
-            clob_ids   = m.get("clobTokenIds") or []
-            tokens     = m.get("tokens") or []
+            # Gamma returns clobTokenIds and outcomes as JSON-encoded strings sometimes
+            def _parse_json_or_csv(val):
+                if not val: return []
+                if isinstance(val, list): return val
+                if isinstance(val, str):
+                    val = val.strip()
+                    if val.startswith("["):
+                        try: return json.loads(val)
+                        except: pass
+                    return [v.strip().strip('"') for v in val.split(",")]
+                return []
+
+            clob_ids     = _parse_json_or_csv(m.get("clobTokenIds"))
+            tokens       = m.get("tokens") or []
             outcomes_raw = m.get("outcomes", "")
-            outcomes   = [o.strip() for o in (outcomes_raw.split(",") if isinstance(outcomes_raw, str) else outcomes_raw)]
+            outcomes     = _parse_json_or_csv(outcomes_raw)
+            # Strip any leftover quotes from outcome strings
+            outcomes     = [str(o).strip().strip('"').strip("'") for o in outcomes]
 
             log.info(f"[GAMMA] clobTokenIds={clob_ids}")
             log.info(f"[GAMMA] tokens={tokens}")
@@ -356,12 +370,24 @@ async def _gamma_slug(session: aiohttp.ClientSession, slug: str, end_ts_override
     return None
 
 def enrich_market(client: ClobClient, market: Market) -> Market:
-    try:    market.tick_size = str(client.get_tick_size(market.up_token_id))
-    except Exception as e: log.warning(f"tick_size: {e}")
+    # Ensure token IDs are clean strings before any API calls
+    def _clean(tid):
+        if isinstance(tid, list): tid = tid[0] if tid else ""
+        s = str(tid).strip().strip("[]\"' ")
+        return s
+    market.up_token_id   = _clean(market.up_token_id)
+    market.down_token_id = _clean(market.down_token_id)
+    log.info(f"[ENRICH] up_token_id={market.up_token_id[:20]}...")
+    log.info(f"[ENRICH] down_token_id={market.down_token_id[:20]}...")
+    try:
+        market.tick_size = str(client.get_tick_size(market.up_token_id))
+    except Exception as e:
+        log.warning(f"tick_size: {e} — using default 0.01")
     try:
         fr = client.get_fee_rate(market.up_token_id)
         market.fee_rate = str(fr) if fr is not None else "0"
-    except Exception as e: log.warning(f"fee_rate: {e}")
+    except Exception:
+        market.fee_rate = "0"  # fee_rate not available in this SDK version
     log.info(f"Market ready: {market.slug} | tick={market.tick_size} fee_bps={market.fee_rate}")
     return market
 
