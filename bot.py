@@ -546,7 +546,7 @@ def should_stop_loss(position: Position, history: deque, time_left: int) -> Opti
     if not bids:
         return None
     current_bid = bids[-1]
-    if current_bid < STOP_LOSS_BID:
+    if current_bid > 0 and current_bid < STOP_LOSS_BID:
         log.info(f"  Stop-loss triggered: bid={current_bid:.4f} < threshold={STOP_LOSS_BID}")
         return current_bid
     return None
@@ -585,10 +585,19 @@ async def wait_for_wss_resolution(state: BotState, timeout: int = 180) -> Option
 async def run_market_wss(state: BotState, client: ClobClient,
                          session: aiohttp.ClientSession, stop: asyncio.Event):
     log.info("[WSS] WebSocket task started — waiting for market...")
+    current_slug = None  # track which market we're subscribed to
+
     while not stop.is_set():
         if not state.market:
             await asyncio.sleep(1)
             continue
+
+        # If market changed, reconnect with new tokens
+        if state.market.slug == current_slug:
+            await asyncio.sleep(0.1)
+            continue
+
+        current_slug = state.market.slug
 
         # Ensure token IDs are clean strings (not lists or bracket-wrapped)
         def _clean_id(tid):
@@ -680,10 +689,10 @@ async def run_market_wss(state: BotState, client: ClobClient,
                             log.info(f"[WSS] unhandled event: {etype}")
 
                 ping_t.cancel()
-
         except Exception as e:
             if not stop.is_set():
                 log.warning(f"WSS dropped (reconnect in 2s): {e}")
+                current_slug = None  # force reconnect with current market
                 await asyncio.sleep(2)
 
 async def _wss_ping(ws, stop):
@@ -864,10 +873,9 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
             status = resp.get("status", "") if resp else ""
             log.info(f"  Attempt {attempt} resp: status={status} size_matched={size_matched}")
 
-            if size_matched > 0:
-                log.info(f"  ✅ FILLED on attempt {attempt}! size_matched={size_matched}")
-                # Fall through to position tracking below
-                break
+            if status in ("live", "matched", "filled") or size_matched > 0:
+                log.info(f"  ✅ Order accepted on attempt {attempt} (status={status}) — stopping retries")
+                break  # Order is in the book or filled — do NOT retry
 
             # Rate limit: 1s between retries (well under Polymarket's 10 req/s limit)
             await asyncio.sleep(1)
@@ -1009,16 +1017,19 @@ async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, st
     state.resolved         = None
     state.presigned_order  = None
     state.presigned_for    = None
+    state.position         = None  # always clear position on advance
     state.price_history    = deque(maxlen=200)
-    # Note: state.position cleared in _resolve_position/_do_stop_loss, not here
-    # (in case advance_market is called while position is still pending — unlikely but safe)
 
     if state.next_market:
         m = await _gamma_slug(session, state.next_market.slug)
-        if m:
+        if m and m.end_ts > server_ts:  # validate end_ts is in the future
             state.market      = enrich_market(client, m)
             state.next_market = None
+            log.info(f"[ADVANCE] Loaded queued market: {m.slug} | ends in {m.end_ts - server_ts}s")
             return
+        else:
+            log.warning(f"[ADVANCE] Queued market invalid or expired, scanning fresh...")
+            state.next_market = None
 
     m = await fetch_btc_market(session, server_ts)
     if m:
