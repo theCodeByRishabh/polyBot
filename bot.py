@@ -323,8 +323,17 @@ async def _gamma_slug(session: aiohttp.ClientSession, slug: str, end_ts_override
                 log.warning(f"[GAMMA] {slug} → could not extract UP/DOWN tokens from any field")
                 return None
 
-            up_id   = (up_market.get("clobTokenIds")   or [None])[0] or next((t["token_id"] for t in up_market.get("tokens",[])   if t.get("outcome","").lower()=="up"),   None)
-            down_id = (down_market.get("clobTokenIds") or [None])[0] or next((t["token_id"] for t in down_market.get("tokens",[]) if t.get("outcome","").lower()=="down"), None)
+            def _extract_id(market_obj, side):
+                ids = market_obj.get("clobTokenIds") or []
+                if ids and isinstance(ids[0], str) and len(ids[0]) > 10:
+                    return ids[0]
+                # fallback to tokens array
+                for t in market_obj.get("tokens", []):
+                    if t.get("outcome","").lower() == side:
+                        return t.get("token_id","")
+                return None
+            up_id   = _extract_id(up_market,   "up")
+            down_id = _extract_id(down_market, "down")
 
             if not up_id or not down_id:
                 log.warning(f"[GAMMA] {slug} → token IDs missing after all attempts")
@@ -542,11 +551,20 @@ async def run_market_wss(state: BotState, client: ClobClient,
             await asyncio.sleep(1)
             continue
 
-        asset_ids = [state.market.up_token_id, state.market.down_token_id]
+        # Ensure token IDs are clean strings (not lists or bracket-wrapped)
+        def _clean_id(tid):
+            if isinstance(tid, list): tid = tid[0] if tid else ""
+            return str(tid).strip().strip("[]"'")
+        up_id_clean   = _clean_id(state.market.up_token_id)
+        down_id_clean = _clean_id(state.market.down_token_id)
+        state.market.up_token_id   = up_id_clean
+        state.market.down_token_id = down_id_clean
+
+        asset_ids = [up_id_clean, down_id_clean]
         sub = json.dumps({"assets_ids": asset_ids, "type": "market",
                           "custom_feature_enabled": True})
         log.info(f"[WSS] Connecting to {WSS_MARKET} for {state.market.slug}...")
-        log.info(f"[WSS] Subscribing to tokens: UP={state.market.up_token_id[:16]}... DOWN={state.market.down_token_id[:16]}...")
+        log.info(f"[WSS] Subscribing to tokens: UP={up_id_clean[:16]}... DOWN={down_id_clean[:16]}...")
         try:
             async with websockets.connect(WSS_MARKET, ping_interval=None, open_timeout=10) as ws:
                 await ws.send(sub)
@@ -556,57 +574,71 @@ async def run_market_wss(state: BotState, client: ClobClient,
                 async for raw in ws:
                     if stop.is_set(): break
                     if raw in ("PING","PONG"): continue
-                    try: msg = json.loads(raw)
-                    except: continue
+                    try:
+                        parsed = json.loads(raw)
+                    except:
+                        continue
 
-                    etype = msg.get("event_type","")
+                    # Polymarket WSS sends either a single dict OR a list of dicts
+                    messages = parsed if isinstance(parsed, list) else [parsed]
 
-                    if etype == "price_change":
-                        for ch in msg.get("price_changes",[]):
+                    for msg in messages:
+                        if not isinstance(msg, dict):
+                            continue
+
+                        etype = msg.get("event_type","")
+
+                        if etype == "price_change":
+                            for ch in msg.get("price_changes",[]):
+                                state.price_history.append(PriceTick(
+                                    ts=time.time(), token_id=ch.get("asset_id",""),
+                                    best_bid=float(ch.get("best_bid",0) or 0),
+                                    best_ask=float(ch.get("best_ask",1) or 1),
+                                ))
+                            if len(state.price_history) <= 3:
+                                log.info(f"[WSS] First price tick! total={len(state.price_history)}")
+
+                        elif etype == "best_bid_ask":
                             state.price_history.append(PriceTick(
-                                ts=time.time(), token_id=ch.get("asset_id",""),
-                                best_bid=float(ch.get("best_bid",0)),
-                                best_ask=float(ch.get("best_ask",1)),
+                                ts=time.time(), token_id=msg.get("asset_id",""),
+                                best_bid=float(msg.get("best_bid",0) or 0),
+                                best_ask=float(msg.get("best_ask",1) or 1),
                             ))
-                        if len(state.price_history) <= 3:
-                            log.info(f"[WSS] First price tick received! {len(state.price_history)} ticks so far")
+                            if len(state.price_history) <= 3:
+                                log.info(f"[WSS] First best_bid_ask tick! total={len(state.price_history)}")
 
-                    elif etype == "best_bid_ask":
-                        state.price_history.append(PriceTick(
-                            ts=time.time(), token_id=msg.get("asset_id",""),
-                            best_bid=float(msg.get("best_bid",0)),
-                            best_ask=float(msg.get("best_ask",1)),
-                        ))
+                        elif etype == "last_trade_price":
+                            state.trade_history.append(TradeTick(
+                                ts=time.time(), token_id=msg.get("asset_id",""),
+                                size=float(msg.get("size",0) or 0),
+                            ))
 
-                    elif etype == "last_trade_price":
-                        state.trade_history.append(TradeTick(
-                            ts=time.time(), token_id=msg.get("asset_id",""),
-                            size=float(msg.get("size",0)),
-                        ))
+                        elif etype == "tick_size_change":
+                            if state.market:
+                                state.market.tick_size = msg.get("new_tick_size","0.01")
+                                state.presigned_order  = None
+                                log.warning(f"Tick size changed → {state.market.tick_size}")
 
-                    elif etype == "tick_size_change":
-                        if state.market:
-                            state.market.tick_size = msg.get("new_tick_size","0.01")
-                            state.presigned_order  = None  # invalidate cached order
-                            log.warning(f"Tick size changed → {state.market.tick_size}")
+                        elif etype == "new_market":
+                            slug = msg.get("slug","")
+                            if "btc-updown-5m" in slug.lower():
+                                assets   = msg.get("assets_ids",[])
+                                outcomes = msg.get("outcomes",[])
+                                if len(assets)==2 and len(outcomes)==2:
+                                    up_i = next((i for i,o in enumerate(outcomes) if o.lower()=="up"),0)
+                                    state.next_market = Market(
+                                        slug=slug, end_ts=0,
+                                        up_token_id=assets[up_i], down_token_id=assets[1-up_i],
+                                        condition_id=msg.get("market",""),
+                                    )
+                                    log.info(f"[WSS] Next market queued: {slug}")
 
-                    elif etype == "new_market":
-                        slug = msg.get("slug","")
-                        if "btc-updown-5m" in slug.lower():
-                            assets   = msg.get("assets_ids",[])
-                            outcomes = msg.get("outcomes",[])
-                            if len(assets)==2 and len(outcomes)==2:
-                                up_i = next((i for i,o in enumerate(outcomes) if o.lower()=="up"),0)
-                                state.next_market = Market(
-                                    slug=slug, end_ts=0,
-                                    up_token_id=assets[up_i], down_token_id=assets[1-up_i],
-                                    condition_id=msg.get("market",""),
-                                )
-                                log.info(f"Next market queued: {slug}")
+                        elif etype == "market_resolved":
+                            state.resolved = msg.get("winning_asset_id","")
+                            log.info(f"[WSS] Market resolved: winner={state.resolved[:20]}...")
 
-                    elif etype == "market_resolved":
-                        state.resolved = msg.get("winning_asset_id","")
-                        log.info(f"Market resolved via WSS: winner={state.resolved[:20]}...")
+                        elif etype:
+                            log.info(f"[WSS] unhandled event: {etype}")
 
                 ping_t.cancel()
 
