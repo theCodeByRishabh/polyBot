@@ -1194,28 +1194,123 @@ async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> boo
 
 
 async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, state: BotState):
-    """Called when WSS market_resolved arrives. Determines win/loss and redeems if won."""
+    """
+    Called when WSS market_resolved fires.
+    Determines win/loss, saves the trade record, then launches a background
+    redemption task that waits for the prize to become available on-chain
+    (typically 2-3 min after resolution) and keeps polling every 5 seconds
+    until the redeem succeeds or 10 minutes elapses.
+    """
     pos  = state.position
     won  = (state.resolved == pos.token_id)
     outcome = "win" if won else "loss"
     fee_bps = float(state.market.fee_rate or 0)
     payout, gross, fee_usdc, net = calc_profit(STAKE, pos.entry_price, 1.0, fee_bps, outcome)
 
+    bal_before = state.last_balance
+    state.consecutive_losses = 0 if won else state.consecutive_losses + 1
+
+    log.info(f"{'WIN ✅' if won else 'LOSS ❌'}: gross={gross:+.4f} fee={fee_usdc:.5f} net={net:+.4f}")
+
     if won:
         cid = pos.market.condition_id
         if cid:
-            log.info(f"[REDEEM] WIN — auto-redeeming condition_id={cid[:20]}...")
-            await asyncio.sleep(5)          # let oracle fully settle before redeem call
-            await _auto_redeem(session, cid)
-            await asyncio.sleep(5)          # let balance propagate before reading it
+            log.info(f"[REDEEM] WIN detected — launching background redemption task for {cid[:20]}...")
+            # Fire-and-forget: does NOT block the trading loop from advancing
+            asyncio.create_task(
+                _background_redeem(session, client, state, cid, pos, gross, fee_usdc, net, bal_before)
+            )
         else:
-            log.warning("[REDEEM] WIN but condition_id is empty — cannot auto-redeem. Claim manually.")
+            log.warning("[REDEEM] WIN but condition_id is empty — cannot auto-redeem.")
+            bal_after = get_balance(client)
+            state.last_balance = bal_after
+            _save_resolved_trade(pos, outcome, payout, gross, fee_usdc, net, bal_before, bal_after)
+    else:
+        bal_after = get_balance(client)
+        state.last_balance = bal_after
+        log.info(f"Balance after loss: ${bal_after:.4f}")
+        _save_resolved_trade(pos, outcome, payout, gross, fee_usdc, net, bal_before, bal_after)
 
-    bal_after = get_balance(client)
-    state.last_balance = bal_after
-    state.consecutive_losses = 0 if won else state.consecutive_losses + 1
 
-    log.info(f"{'WIN' if won else 'LOSS'}: gross={gross:+.4f} fee={fee_usdc:.5f} net={net:+.4f} | balance=${bal_after:.4f}")
+async def _background_redeem(
+    session: aiohttp.ClientSession,
+    client: ClobClient,
+    state: BotState,
+    condition_id: str,
+    pos,
+    gross: float,
+    fee_usdc: float,
+    net: float,
+    bal_before: float,
+):
+    """
+    Background task: waits for on-chain settlement then redeems.
+
+    Timeline after a 5-min BTC market resolves:
+      ~0-30s   : WSS market_resolved fires, oracle tx submitted
+      ~2-3 min : oracle tx confirmed, redeemPositions becomes callable
+      ~3-5 min : relayer processes our redeem tx
+      ~10 min  : hard timeout — give up and log a warning
+
+    Strategy:
+      1. Wait 3 minutes before first attempt (oracle needs time to settle)
+      2. Try to redeem
+      3. If not yet confirmed, poll every 5 seconds
+      4. After each attempt, read balance — if it went up, we're done
+      5. Give up after 10 minutes total
+    """
+    INITIAL_WAIT_SEC = 180   # 3 min — oracle settlement time
+    POLL_INTERVAL    = 5     # seconds between retries
+    HARD_TIMEOUT     = 600   # 10 min total before giving up
+
+    log.info(f"[REDEEM] Waiting {INITIAL_WAIT_SEC}s for oracle to settle ({condition_id[:20]}...)...")
+    await asyncio.sleep(INITIAL_WAIT_SEC)
+
+    deadline   = time.time() + (HARD_TIMEOUT - INITIAL_WAIT_SEC)
+    bal_before_redeem = get_balance(client)
+    attempt    = 0
+
+    while time.time() < deadline:
+        attempt += 1
+        log.info(f"[REDEEM] Attempt {attempt} — calling _auto_redeem...")
+        success = await _auto_redeem(session, condition_id)
+
+        # Read balance after each attempt
+        await asyncio.sleep(POLL_INTERVAL)
+        bal_now = get_balance(client)
+        state.last_balance = bal_now
+
+        gained = bal_now - bal_before_redeem
+        log.info(f"[REDEEM] Balance check: ${bal_before_redeem:.4f} → ${bal_now:.4f} (gained ${gained:+.4f})")
+
+        if success or gained > 0.01:
+            log.info(f"[REDEEM] ✅ Redemption confirmed! New balance: ${bal_now:.4f}")
+            _save_resolved_trade(pos, "win", gained, gross, fee_usdc, net, bal_before, bal_now)
+            return
+
+        if time.time() >= deadline:
+            break
+
+        log.info(f"[REDEEM] Not yet redeemable — retrying in {POLL_INTERVAL}s...")
+        await asyncio.sleep(POLL_INTERVAL)
+
+    # Timed out — save trade with whatever balance we have now
+    bal_final = get_balance(client)
+    state.last_balance = bal_final
+    log.warning(f"[REDEEM] ⚠️ Timed out after {HARD_TIMEOUT}s. Balance: ${bal_final:.4f}. Claim manually.")
+    _save_resolved_trade(pos, "win", bal_final - bal_before, gross, fee_usdc, net, bal_before, bal_final)
+
+
+def _save_resolved_trade(pos, outcome, payout, gross, fee_usdc, net, bal_before, bal_after):
+    """Save the final trade record after resolution."""
+    save_trade(TradeRecord(
+        cycle_id=pos.cycle_id, side=pos.side,
+        entry_price=pos.entry_price, exit_price=1.0 if outcome == "win" else 0.0,
+        shares_held=pos.shares, stake=STAKE, outcome=outcome,
+        payout=payout, gross_profit=gross, fee_usdc=fee_usdc, net_profit=net,
+        balance_before=bal_before, balance_after=bal_after,
+        market_slug=pos.market.slug, timestamp=_ts(),
+    ))
 async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
                         state: BotState, exit_bid: float):
     """Execute a stop-loss SELL when price crashes below 60%."""
