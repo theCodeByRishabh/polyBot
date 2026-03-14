@@ -260,100 +260,97 @@ GAMMA_HEADERS = {
 }
 
 async def _gamma_slug(session: aiohttp.ClientSession, slug: str, end_ts_override: int = 0) -> Optional[Market]:
+    """
+    Fetch market data from Gamma API.
+    These BTC 5m markets have ONE market object with TWO outcomes (Up/Down)
+    stored in clobTokenIds[0] and clobTokenIds[1], ordered by the outcomes string.
+    """
     try:
-        # Fetch via events endpoint — returns full token data including clobTokenIds
-        params = {"slug": slug}
-        async with session.get(f"{GAMMA_API}/events", params=params,
+        async with session.get(f"{GAMMA_API}/events", params={"slug": slug},
                                headers=GAMMA_HEADERS,
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
             log.info(f"[GAMMA] GET /events?slug={slug} → HTTP {r.status}")
             if r.status != 200:
-                log.warning(f"[GAMMA] {slug} → HTTP {r.status}")
                 return None
             data = await r.json()
             if not data:
-                log.info(f"[GAMMA] {slug} → empty response from /events")
                 return None
 
-            event = data[0]
+            event  = data[0]
             markets = event.get("markets", [])
-            log.info(f"[GAMMA] {slug} → event found, {len(markets)} market(s)")
+            log.info(f"[GAMMA] event has {len(markets)} market(s)")
 
             if not markets:
-                # Fallback: try /markets endpoint with clob token params
-                log.info(f"[GAMMA] {slug} → no markets in event, trying /markets endpoint...")
-                async with session.get(f"{GAMMA_API}/markets", params={"slug": slug},
-                                       headers=GAMMA_HEADERS,
-                                       timeout=aiohttp.ClientTimeout(total=10)) as r2:
-                    if r2.status != 200: return None
-                    mdata = await r2.json()
-                    if not mdata: return None
-                    markets = mdata
-                    log.info(f"[GAMMA] /markets fallback returned {len(markets)} record(s)")
-
-            # Find the UP and DOWN markets
-            up_market   = next((m for m in markets if m.get("groupItemTitle","").upper() == "UP"   or "up"   in m.get("question","").lower()), None)
-            down_market = next((m for m in markets if m.get("groupItemTitle","").upper() == "DOWN" or "down" in m.get("question","").lower()), None)
-
-            log.info(f"[GAMMA] market titles: {[m.get('groupItemTitle') or m.get('question','?')[:30] for m in markets]}")
-
-            if not up_market or not down_market:
-                # Last resort: use clobTokenIds from single market with outcomes
-                for m in markets:
-                    tokens = m.get("tokens", [])
-                    clob_ids = m.get("clobTokenIds", [])
-                    outcomes = m.get("outcomes", "").split(",") if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
-                    # Dump ALL keys so we can see what's actually there
-                    log.info(f"[GAMMA] market keys: {list(m.keys())}")
-                    log.info(f"[GAMMA] market raw — tokens={tokens} clobTokenIds={clob_ids} outcomes={outcomes}")
-                    log.info(f"[GAMMA] outcomePrices={m.get('outcomePrices')} conditionId={m.get('conditionId','')[:16]}")
-                    if len(clob_ids) >= 2:
-                        # outcomes order: index 0 = first outcome
-                        outcome_list = [o.strip() for o in outcomes]
-                        up_i   = next((i for i,o in enumerate(outcome_list) if o.lower() == "up"),   0)
-                        down_i = next((i for i,o in enumerate(outcome_list) if o.lower() == "down"), 1)
-                        try:
-                            end_dt = datetime.fromisoformat(m["endDate"].replace("Z", "+00:00"))
-                            end_ts = int(end_dt.timestamp())
-                        except Exception:
-                            end_ts = end_ts_override
-                        log.info(f"[GAMMA] ✅ using clobTokenIds: up={clob_ids[up_i][:12]}... end_ts={end_ts}")
-                        return Market(
-                            slug=m.get("slug", slug), end_ts=end_ts,
-                            up_token_id=clob_ids[up_i], down_token_id=clob_ids[down_i],
-                            condition_id=m.get("conditionId",""), neg_risk=m.get("negRisk",False),
-                        )
-                log.warning(f"[GAMMA] {slug} → could not extract UP/DOWN tokens from any field")
                 return None
 
-            def _extract_id(market_obj, side):
-                ids = market_obj.get("clobTokenIds") or []
-                if ids and isinstance(ids[0], str) and len(ids[0]) > 10:
-                    return ids[0]
-                # fallback to tokens array
-                for t in market_obj.get("tokens", []):
-                    if t.get("outcome","").lower() == side:
-                        return t.get("token_id","")
-                return None
-            up_id   = _extract_id(up_market,   "up")
-            down_id = _extract_id(down_market, "down")
+            # BTC Up/Down is a single market with 2 outcomes — dump raw to log
+            m = markets[0]
+            log.info(f"[GAMMA] market keys: {sorted(m.keys())}")
 
-            if not up_id or not down_id:
-                log.warning(f"[GAMMA] {slug} → token IDs missing after all attempts")
-                return None
+            # Try every possible field that could hold token IDs
+            clob_ids   = m.get("clobTokenIds") or []
+            tokens     = m.get("tokens") or []
+            outcomes_raw = m.get("outcomes", "")
+            outcomes   = [o.strip() for o in (outcomes_raw.split(",") if isinstance(outcomes_raw, str) else outcomes_raw)]
 
+            log.info(f"[GAMMA] clobTokenIds={clob_ids}")
+            log.info(f"[GAMMA] tokens={tokens}")
+            log.info(f"[GAMMA] outcomes={outcomes}")
+
+            # Parse end date
             try:
-                end_dt = datetime.fromisoformat(up_market["endDate"].replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(m["endDate"].replace("Z", "+00:00"))
                 end_ts = int(end_dt.timestamp())
             except Exception:
                 end_ts = end_ts_override
 
-            log.info(f"[GAMMA] ✅ {slug} → end_ts={end_ts} up={up_id[:12]}... down={down_id[:12]}...")
-            return Market(
-                slug=slug, end_ts=end_ts,
-                up_token_id=up_id, down_token_id=down_id,
-                condition_id=up_market.get("conditionId",""), neg_risk=up_market.get("negRisk",False),
-            )
+            # Strategy 1: clobTokenIds with outcomes ordering
+            if len(clob_ids) >= 2 and len(outcomes) >= 2:
+                up_i   = next((i for i,o in enumerate(outcomes) if o.lower() == "up"),   0)
+                down_i = next((i for i,o in enumerate(outcomes) if o.lower() == "down"), 1)
+                up_id, down_id = clob_ids[up_i], clob_ids[down_i]
+                log.info(f"[GAMMA] ✅ Strategy 1 — clobTokenIds: up={str(up_id)[:16]}... down={str(down_id)[:16]}... end={end_ts}")
+                return Market(slug=slug, end_ts=end_ts, up_token_id=str(up_id),
+                              down_token_id=str(down_id), condition_id=m.get("conditionId",""),
+                              neg_risk=m.get("negRisk", False))
+
+            # Strategy 2: tokens array
+            if len(tokens) >= 2:
+                up_tok   = next((t for t in tokens if str(t.get("outcome","")).lower() == "up"),   None)
+                down_tok = next((t for t in tokens if str(t.get("outcome","")).lower() == "down"), None)
+                if up_tok and down_tok:
+                    up_id   = up_tok.get("token_id") or up_tok.get("id","")
+                    down_id = down_tok.get("token_id") or down_tok.get("id","")
+                    log.info(f"[GAMMA] ✅ Strategy 2 — tokens array: up={str(up_id)[:16]}...")
+                    return Market(slug=slug, end_ts=end_ts, up_token_id=str(up_id),
+                                  down_token_id=str(down_id), condition_id=m.get("conditionId",""),
+                                  neg_risk=m.get("negRisk", False))
+
+            # Strategy 3: fallback to /markets endpoint
+            log.info(f"[GAMMA] trying /markets endpoint as fallback...")
+            async with session.get(f"{GAMMA_API}/markets", params={"slug": slug},
+                                   headers=GAMMA_HEADERS,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r2:
+                if r2.status == 200:
+                    mdata = await r2.json()
+                    if mdata:
+                        m2 = mdata[0]
+                        log.info(f"[GAMMA] /markets keys: {sorted(m2.keys())}")
+                        log.info(f"[GAMMA] /markets clobTokenIds={m2.get('clobTokenIds')} outcomes={m2.get('outcomes')}")
+                        clob2    = m2.get("clobTokenIds") or []
+                        out2_raw = m2.get("outcomes", "")
+                        out2     = [o.strip() for o in (out2_raw.split(",") if isinstance(out2_raw, str) else out2_raw)]
+                        if len(clob2) >= 2 and len(out2) >= 2:
+                            up_i   = next((i for i,o in enumerate(out2) if o.lower() == "up"),   0)
+                            down_i = next((i for i,o in enumerate(out2) if o.lower() == "down"), 1)
+                            log.info(f"[GAMMA] ✅ Strategy 3 — /markets fallback")
+                            return Market(slug=slug, end_ts=end_ts, up_token_id=str(clob2[up_i]),
+                                          down_token_id=str(clob2[down_i]), condition_id=m2.get("conditionId",""),
+                                          neg_risk=m2.get("negRisk", False))
+
+            log.warning(f"[GAMMA] ❌ all strategies failed for {slug}")
+            return None
+
     except Exception as e:
         log.warning(f"[GAMMA] fetch error [{slug}]: {e}", exc_info=True)
     return None
