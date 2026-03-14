@@ -713,7 +713,16 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
                     log.info("[LOOP] No market available yet — will retry in 15s")
             continue
 
-        server_ts = int(client.get_server_time())
+        # Use local clock + server offset — sync with server every 30s instead of every second
+        now_local = time.time()
+        if not hasattr(state, '_clock_offset') or now_local - getattr(state, '_last_sync', 0) > 30:
+            try:
+                server_ts_raw = int(client.get_server_time())
+                state._clock_offset = server_ts_raw - now_local
+                state._last_sync = now_local
+            except Exception:
+                state._clock_offset = getattr(state, '_clock_offset', 0.0)
+        server_ts = int(now_local + getattr(state, '_clock_offset', 0.0))
         time_left = state.market.end_ts - server_ts
 
         # Log status every 10s
