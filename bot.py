@@ -35,7 +35,7 @@ from typing import Optional
 import aiohttp
 import websockets
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import AssetType
+from py_clob_client.clob_types import AssetType, OrderArgs, OrderType, BalanceAllowanceParams
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -460,13 +460,15 @@ async def liquidity_ok(session: aiohttp.ClientSession, token_id: str, price: flo
 def presign_order(client: ClobClient, market: Market, token_id: str, price: float):
     """Build and EIP-712 sign the BUY order at T-40s so it's ready to POST at fire time."""
     try:
-        return client.create_market_order(
+        # size = number of shares = dollar amount / price
+        size = round(STAKE / price, 4)
+        order_args = OrderArgs(
             token_id = token_id,
-            side     = BUY,
-            amount   = STAKE,
             price    = price,
-            options  = {"tick_size": market.tick_size, "neg_risk": market.neg_risk},
+            size     = size,
+            side     = BUY,
         )
+        return client.create_order(order_args)
     except Exception as e:
         log.error(f"Presign error: {e}")
         return None
@@ -481,7 +483,7 @@ async def execute_buy(client: ClobClient, market: Market, token_id: str,
 
     log.info(f"BUYING: BTC {side.upper()} ${STAKE:.2f} FOK @ floor={price:.4f}")
     try:
-        resp = await with_retry(lambda: client.post_order(order, "FOK"), "buy_order")
+        resp = await with_retry(lambda: client.post_order(order, OrderType.FOK), "buy_order")
         log.info(f"  Buy response: {resp}")
         return resp
     except ExchangeDisabledError:
@@ -505,14 +507,14 @@ async def execute_sell(client: ClobClient, market: Market, position: Position,
     floor = max(exit_price - 0.02, 0.01)
     log.info(f"STOP-LOSS SELL: {position.shares:.6f} shares @ floor={floor:.4f}")
     try:
-        order = client.create_market_order(
+        order_args = OrderArgs(
             token_id = position.token_id,
-            side     = SELL,
-            amount   = position.shares,
             price    = floor,
-            options  = {"tick_size": market.tick_size, "neg_risk": market.neg_risk},
+            size     = position.shares,
+            side     = SELL,
         )
-        resp = client.post_order(order, "FAK")  # FAK: fill what we can, cancel rest
+        order = client.create_order(order_args)
+        resp = client.post_order(order, OrderType.FAK)  # FAK: fill what we can, cancel rest
         log.info(f"  Sell response: {resp}")
         return resp
     except Exception as e:
