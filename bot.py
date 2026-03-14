@@ -56,7 +56,7 @@ CHAIN_ID        = 137
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
 STAKE             = 1.00    # Fixed $1.00 per trade
-BASE_THRESHOLD    = 0.95    # Buy when dominant side ask >= 95%
+BASE_THRESHOLD    = 0.93    # Buy when dominant side ask >= 93%
 ADAPTIVE_THRESH   = 0.97    # Raised after 2 consecutive losses
 ENTRY_WINDOW_SEC  = 30      # Enter any time price >= threshold AND <=30s remain
 PRESIGN_BEFORE    = 40      # Build signed order at T-40s (removes signing latency)
@@ -485,9 +485,9 @@ async def execute_buy(client: ClobClient, market: Market, token_id: str,
     if not order:
         return None
 
-    log.info(f"BUYING: BTC {side.upper()} ${STAKE:.2f} FOK @ floor={price:.4f}")
+    log.info(f"BUYING: BTC {side.upper()} ${STAKE:.2f} FAK @ floor={price:.4f}")
     try:
-        resp = await with_retry(lambda: client.post_order(order, OrderType.FOK), "buy_order")
+        resp = await with_retry(lambda: client.post_order(order, OrderType.FAK), "buy_order")
         log.info(f"  Buy response: {resp}")
         return resp
     except ExchangeDisabledError:
@@ -827,7 +827,11 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
 async def _do_buy(client, session, state: BotState, side, token_id, price, bal_before):
     resp = await execute_buy(client, state.market, token_id, side, price, state)
 
-    if not resp or resp.get("status") in ("", "unmatched"):
+    # FAK: check size_matched to determine fill
+    size_matched = float(resp.get("size_matched", 0)) if resp else 0
+    log.info(f"  Buy resp: status={resp.get('status') if resp else 'None'} size_matched={size_matched}")
+
+    if not resp or size_matched == 0:
         log.info("Buy unmatched — no fill.")
         save_trade(TradeRecord(
             cycle_id=_cycle_id(), side=side, entry_price=price, exit_price=0,
