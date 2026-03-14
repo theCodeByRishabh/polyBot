@@ -618,13 +618,25 @@ async def run_market_wss(state: BotState, client: ClobClient,
                 await ws.send(sub)
                 log.info(f"[WSS] ✅ Connected & subscribed: {state.market.slug}")
                 ping_t = asyncio.create_task(_wss_ping(ws, stop))
+                subscribed_slug = current_slug  # capture slug this connection was opened for
 
                 async for raw in ws:
-                    if stop.is_set(): break
-                    if raw in ("PING","PONG"): continue
+                    if stop.is_set():
+                        break
+
+                    # KEY FIX: if market was advanced while we were in this
+                    # inner loop, break immediately so we reconnect with the
+                    # new market's token IDs. Without this the loop keeps
+                    # reading from the old socket and never re-subscribes.
+                    if state.market and state.market.slug != subscribed_slug:
+                        log.info(f"[WSS] Market changed → {state.market.slug} — closing old socket")
+                        break
+
+                    if raw in ("PING", "PONG"):
+                        continue
                     try:
                         parsed = json.loads(raw)
-                    except:
+                    except Exception:
                         continue
 
                     # Polymarket WSS sends either a single dict OR a list of dicts
@@ -634,66 +646,88 @@ async def run_market_wss(state: BotState, client: ClobClient,
                         if not isinstance(msg, dict):
                             continue
 
-                        etype = msg.get("event_type","")
+                        etype = msg.get("event_type", "")
 
                         if etype == "price_change":
-                            for ch in msg.get("price_changes",[]):
+                            for ch in msg.get("price_changes", []):
+                                tid = ch.get("asset_id", "")
+                                # Filter: only accept ticks for the current market's tokens
+                                if state.market and tid not in (
+                                    state.market.up_token_id, state.market.down_token_id
+                                ):
+                                    continue
                                 state.price_history.append(PriceTick(
-                                    ts=time.time(), token_id=ch.get("asset_id",""),
-                                    best_bid=float(ch.get("best_bid",0) or 0),
-                                    best_ask=float(ch.get("best_ask",1) or 1),
+                                    ts=time.time(), token_id=tid,
+                                    best_bid=float(ch.get("best_bid", 0) or 0),
+                                    best_ask=float(ch.get("best_ask", 1) or 1),
                                 ))
                             if len(state.price_history) <= 3:
                                 log.info(f"[WSS] First price tick! total={len(state.price_history)}")
 
                         elif etype == "best_bid_ask":
+                            tid = msg.get("asset_id", "")
+                            if state.market and tid not in (
+                                state.market.up_token_id, state.market.down_token_id
+                            ):
+                                continue
                             state.price_history.append(PriceTick(
-                                ts=time.time(), token_id=msg.get("asset_id",""),
-                                best_bid=float(msg.get("best_bid",0) or 0),
-                                best_ask=float(msg.get("best_ask",1) or 1),
+                                ts=time.time(), token_id=tid,
+                                best_bid=float(msg.get("best_bid", 0) or 0),
+                                best_ask=float(msg.get("best_ask", 1) or 1),
                             ))
                             if len(state.price_history) <= 3:
                                 log.info(f"[WSS] First best_bid_ask tick! total={len(state.price_history)}")
 
                         elif etype == "last_trade_price":
                             state.trade_history.append(TradeTick(
-                                ts=time.time(), token_id=msg.get("asset_id",""),
-                                size=float(msg.get("size",0) or 0),
+                                ts=time.time(), token_id=msg.get("asset_id", ""),
+                                size=float(msg.get("size", 0) or 0),
                             ))
 
                         elif etype == "tick_size_change":
-                            if state.market:
-                                state.market.tick_size = msg.get("new_tick_size","0.01")
-                                state.presigned_order  = None
-                                log.warning(f"Tick size changed → {state.market.tick_size}")
+                            tid = msg.get("asset_id", "")
+                            if state.market and tid in (
+                                state.market.up_token_id, state.market.down_token_id
+                            ):
+                                new_ts = msg.get("new_tick_size", "0.01")
+                                if state.market.tick_size != new_ts:
+                                    state.market.tick_size = new_ts
+                                    state.presigned_order  = None
+                                    log.warning(f"[WSS] Tick size changed → {new_ts}")
 
                         elif etype == "new_market":
-                            slug = msg.get("slug","")
+                            slug = msg.get("slug", "")
                             if "btc-updown-5m" in slug.lower():
-                                assets   = msg.get("assets_ids",[])
-                                outcomes = msg.get("outcomes",[])
-                                if len(assets)==2 and len(outcomes)==2:
-                                    up_i = next((i for i,o in enumerate(outcomes) if o.lower()=="up"),0)
+                                assets   = msg.get("assets_ids", [])
+                                outcomes = msg.get("outcomes", [])
+                                if len(assets) == 2 and len(outcomes) == 2:
+                                    up_i = next(
+                                        (i for i, o in enumerate(outcomes) if o.lower() == "up"), 0
+                                    )
                                     state.next_market = Market(
                                         slug=slug, end_ts=0,
-                                        up_token_id=assets[up_i], down_token_id=assets[1-up_i],
-                                        condition_id=msg.get("market",""),
+                                        up_token_id=assets[up_i],
+                                        down_token_id=assets[1 - up_i],
+                                        condition_id=msg.get("market", ""),
                                     )
                                     log.info(f"[WSS] Next market queued: {slug}")
 
                         elif etype == "market_resolved":
-                            state.resolved = msg.get("winning_asset_id","")
+                            state.resolved = msg.get("winning_asset_id", "")
                             log.info(f"[WSS] Market resolved: winner={state.resolved[:20]}...")
 
                         elif etype and etype not in ("book",):
-                            log.info(f"[WSS] unhandled event: {etype}")
+                            log.debug(f"[WSS] unhandled event: {etype}")
 
                 ping_t.cancel()
         except Exception as e:
             if not stop.is_set():
-                log.warning(f"WSS dropped (reconnect in 2s): {e}")
-                current_slug = None  # force reconnect with current market
+                log.warning(f"[WSS] dropped (reconnect in 2s): {e}")
                 await asyncio.sleep(2)
+        finally:
+            # Always clear current_slug so outer loop reconnects to
+            # whatever market is now active (new or same after error).
+            current_slug = None
 
 async def _wss_ping(ws, stop):
     while not stop.is_set():
