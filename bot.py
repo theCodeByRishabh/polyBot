@@ -1038,151 +1038,63 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
 
 async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> bool:
     """
-    Redeem winning conditional tokens -> USDC via the Builder Relayer.
+    Check whether the winning position is redeemable via the Polymarket Data API.
 
-    Step 1: Poll data-api.polymarket.com/positions to confirm the position
-            is actually redeemable (redeemable=true). This is the definitive
-            signal that the oracle has settled and the redeem will succeed.
+    Polymarket auto-settles all winning positions on-chain within ~2-3 minutes
+    of market resolution. The USDC arrives in the proxy wallet automatically —
+    we do NOT need to call the Builder Relayer at all.
 
-    Step 2: POST to relayer-v2.polymarket.com/execute/proxy using HMAC auth
-            (BUILDER_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE from env).
+    What this function does:
+      1. Calls data-api.polymarket.com/positions?user=<proxy> and looks for
+         a position with redeemable=true and a matching conditionId.
+      2. Returns True if found (prize is already settled / being settled).
+      3. Returns False if not yet redeemable (oracle still confirming).
 
-    These Builder credentials come from:
-        polymarket.com/settings?tab=builder -> Builder Codes -> Create New
-    They are different from Relayer API Keys.
+    The caller (_background_redeem) then reads the CLOB balance every 5s
+    and considers the claim complete once balance increases.
+
+    Builder credentials (BUILDER_KEY etc.) are NOT required for this approach.
+    If you have an approved Builder account you can install poly-web3 and
+    py-builder-relayer-client for instant redemption, but auto-settlement
+    works reliably without them.
     """
-    import json as _json
+    funder = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
 
-    builder_key        = os.environ.get("BUILDER_KEY", "")
-    builder_secret     = os.environ.get("BUILDER_SECRET", "")
-    builder_passphrase = os.environ.get("BUILDER_PASSPHRASE", "")
-    funder             = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
-
-    if not all([builder_key, builder_secret, builder_passphrase]):
-        log.warning(
-            "[REDEEM] Missing BUILDER_KEY/SECRET/PASSPHRASE — "
-            "get from polymarket.com/settings?tab=builder"
-        )
+    if not funder:
+        log.warning("[REDEEM] POLYMARKET_FUNDER_ADDRESS not set — cannot check redeemable status")
         return False
 
     cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
-    if len(cid) != 66:
-        log.error(f"[REDEEM] Bad condition_id length: {cid[:30]}")
-        return False
-
-    # ── Step 1: verify position is redeemable via Data API ────────────────
-    if funder:
-        try:
-            async with session.get(
-                "https://data-api.polymarket.com/positions",
-                params={"user": funder.lower(), "sizeThreshold": "0.01"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                positions = await r.json()
-            redeemable = [p for p in (positions if isinstance(positions, list) else [])
-                          if p.get("redeemable") is True
-                          and p.get("conditionId", "").lower() == cid.lower()]
-            if not redeemable:
-                log.info(f"[REDEEM] Position not yet redeemable (oracle still settling)...")
-                return False
-            log.info(f"[REDEEM] ✅ Position confirmed redeemable: {redeemable[0].get('size','')} tokens")
-        except Exception as e:
-            log.warning(f"[REDEEM] Data API check failed ({e}), attempting redeem anyway...")
-
-    # ── Step 2: encode redeemPositions calldata ───────────────────────────
-    # redeemPositions(address collateral, bytes32 parent, bytes32 conditionId, uint256[] indexSets)
-    # selector = keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[:4] = 9e2e3d85
-    CTF_ADDRESS  = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
-    USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    RELAYER_URL  = "https://relayer-v2.polymarket.com"
-
-    usdc_pad    = USDC_ADDRESS.lower()[2:].zfill(64)
-    parent_zero = "00" * 32
-    cid_pad     = cid[2:].lower().zfill(64)
-    # dynamic array: offset=0x80 (128 bytes), length=2, values [1, 2]
-    calldata = ("0x9e2e3d85"
-                + usdc_pad
-                + parent_zero
-                + cid_pad
-                + "00" * 31 + "80"   # array offset
-                + "00" * 31 + "02"   # array length
-                + "00" * 31 + "01"   # indexSet 1
-                + "00" * 31 + "02")  # indexSet 2
-
-    # ── Step 3: HMAC-sign and POST to /execute/proxy ──────────────────────
-    try:
-        from py_builder_signing_sdk.signing.hmac import build_hmac_signature
-    except ImportError:
-        log.error("[REDEEM] py_builder_signing_sdk not found — cannot sign request")
-        return False
-
-    body_obj  = {
-        "transactions": [{"to": CTF_ADDRESS, "data": calldata, "value": "0"}],
-        "metadata":     f"redeem {cid[:18]}",
-    }
-    body_str  = _json.dumps(body_obj, separators=(",", ":"))
-    path      = "/execute/proxy"
-    timestamp = str(int(time.time()))
 
     try:
-        signature = build_hmac_signature(builder_secret, timestamp, "POST", path, body_str)
-    except Exception as e:
-        log.error(f"[REDEEM] HMAC signing failed: {e}")
-        return False
+        async with session.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": funder.lower(), "sizeThreshold": "0.01"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            positions = await r.json()
 
-    headers = {
-        "Content-Type":           "application/json",
-        "POLY_BUILDER_API_KEY":   builder_key,
-        "POLY_BUILDER_TIMESTAMP": timestamp,
-        "POLY_BUILDER_PASSPHRASE": builder_passphrase,
-        "POLY_BUILDER_SIGNATURE": signature,
-    }
-
-    try:
-        log.info(f"[REDEEM] POST {RELAYER_URL}{path} ...")
-        async with session.post(
-            f"{RELAYER_URL}{path}",
-            data=body_str,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            resp_text = await resp.text()
-            log.info(f"[REDEEM] HTTP {resp.status}: {resp_text[:300]}")
-            if resp.status not in (200, 201, 202):
-                return False
-            resp_json = _json.loads(resp_text)
-            tx_id     = resp_json.get("transactionID", "")
-
-        if not tx_id:
-            log.warning("[REDEEM] No transactionID in response")
+        if not isinstance(positions, list):
+            log.warning(f"[REDEEM] Unexpected positions response: {str(positions)[:100]}")
             return False
 
-        # ── Step 4: poll for confirmation ────────────────────────────────
-        for poll in range(24):   # up to 120s
-            await asyncio.sleep(5)
-            try:
-                async with session.get(
-                    f"{RELAYER_URL}/transaction/{tx_id}",
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as pr:
-                    pd = await pr.json()
-                tx_state = pd.get("state", "")
-                log.info(f"[REDEEM] tx {tx_id[:12]}... state={tx_state} (poll {poll+1}/24)")
-                if tx_state in ("STATE_CONFIRMED", "STATE_MINED", "STATE_EXECUTED"):
-                    log.info(f"[REDEEM] ✅ On-chain redemption confirmed!")
-                    return True
-                if tx_state in ("STATE_FAILED", "STATE_INVALID"):
-                    log.error(f"[REDEEM] ❌ Transaction failed: {pd}")
-                    return False
-            except Exception as e:
-                log.warning(f"[REDEEM] Poll error: {e}")
+        redeemable = [
+            p for p in positions
+            if p.get("redeemable") is True
+            and p.get("conditionId", "").lower() == cid.lower()
+        ]
 
-        log.warning("[REDEEM] Timed out waiting for tx confirmation")
-        return False
+        if redeemable:
+            size = redeemable[0].get("size", "?")
+            log.info(f"[REDEEM] ✅ Position redeemable! size={size} tokens — "
+                     f"Polymarket auto-settlement in progress...")
+            return True
+        else:
+            log.info(f"[REDEEM] Position not yet redeemable (oracle still confirming)...")
+            return False
 
     except Exception as e:
-        log.error(f"[REDEEM] Request failed: {e}")
+        log.warning(f"[REDEEM] Data API check failed: {e}")
         return False
 
 
@@ -1275,12 +1187,31 @@ async def _background_redeem(
 
         log.info(f"[REDEEM] Balance: ${bal_before_redeem:.4f} → ${bal_now:.4f} (gained ${gained:+.4f})")
 
-        if success or gained > 0.01:
+        if gained > 0.01:
+            # Balance already increased — settlement complete
             log.info(f"[REDEEM] ✅ CLAIMED! New balance: ${bal_now:.4f}")
             _save_resolved_trade(pos, "win", gained, gross, fee_usdc, net, bal_before, bal_now)
             return
 
-        log.info(f"[REDEEM] Not yet claimable — next check in {POLL_INTERVAL}s...")
+        if success:
+            # redeemable=True confirmed — Polymarket auto-settlement in progress.
+            # Keep polling balance every 5s until USDC arrives (usually within 30s).
+            log.info(f"[REDEEM] redeemable=True confirmed — waiting for USDC to arrive...")
+            for wait in range(24):  # up to 2 more minutes
+                await asyncio.sleep(5)
+                bal_now = get_balance(client)
+                state.last_balance = bal_now
+                gained = bal_now - bal_before_redeem
+                log.info(f"[REDEEM] Waiting for settlement: bal=${bal_now:.4f} gained=${gained:+.4f} ({wait+1}/24)")
+                if gained > 0.01:
+                    log.info(f"[REDEEM] ✅ CLAIMED! New balance: ${bal_now:.4f}")
+                    _save_resolved_trade(pos, "win", gained, gross, fee_usdc, net, bal_before, bal_now)
+                    return
+            log.warning("[REDEEM] redeemable=True but balance never increased — may need manual claim")
+            _save_resolved_trade(pos, "win", 0, gross, fee_usdc, net, bal_before, bal_now)
+            return
+
+        log.info(f"[REDEEM] Not yet redeemable — next check in {POLL_INTERVAL}s...")
         await asyncio.sleep(POLL_INTERVAL)
 
     # Timed out
