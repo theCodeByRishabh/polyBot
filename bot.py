@@ -230,20 +230,38 @@ async def heartbeat_loop(client: ClobClient, state: BotState, stop: asyncio.Even
 
 # ─── Market discovery ─────────────────────────────────────────────────────────
 async def fetch_btc_market(session: aiohttp.ClientSession, server_ts: int) -> Optional[Market]:
-    for offset in [300, 0]:
+    log.info(f"[MARKET SCAN] server_ts={server_ts} | searching for next BTC 5m market...")
+    for offset in [300, 0, 600]:
         end_ts = ((server_ts // 300) * 300) + offset
-        # Need enough time to actually enter: must have > ENTRY_WINDOW_SEC remaining
         if end_ts <= server_ts + ENTRY_WINDOW_SEC + 2:
+            log.info(f"[MARKET SCAN] slug btc-updown-5m-{end_ts} skipped (only {end_ts - server_ts}s left, need >{ENTRY_WINDOW_SEC+2}s)")
             continue
-        m = await _gamma_slug(session, f"btc-updown-5m-{end_ts}")
-        if m: return m
+        slug = f"btc-updown-5m-{end_ts}"
+        log.info(f"[MARKET SCAN] trying slug: {slug} ({end_ts - server_ts}s remaining)")
+        m = await _gamma_slug(session, slug)
+        if m:
+            log.info(f"[MARKET SCAN] ✅ found market: {slug}")
+            return m
+        else:
+            log.info(f"[MARKET SCAN] ❌ not found: {slug}")
+    log.warning("[MARKET SCAN] no market found — will retry in trading loop")
     return None
+
+GAMMA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Origin": "https://polymarket.com",
+    "Referer": "https://polymarket.com/",
+}
 
 async def _gamma_slug(session: aiohttp.ClientSession, slug: str) -> Optional[Market]:
     try:
         async with session.get(f"{GAMMA_API}/markets", params={"slug": slug},
-                               timeout=aiohttp.ClientTimeout(total=5)) as r:
-            if r.status != 200: return None
+                               headers=GAMMA_HEADERS,
+                               timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                log.warning(f"[GAMMA] {slug} → HTTP {r.status} (if 403: geo-block, check Railway region)")
+                return None
             data = await r.json()
             if not data: return None
             raw    = data[0]
@@ -451,6 +469,7 @@ async def wait_for_wss_resolution(state: BotState, timeout: int = 180) -> Option
 # ─── WebSocket ────────────────────────────────────────────────────────────────
 async def run_market_wss(state: BotState, client: ClobClient,
                          session: aiohttp.ClientSession, stop: asyncio.Event):
+    log.info("[WSS] WebSocket task started — waiting for market...")
     while not stop.is_set():
         if not state.market:
             await asyncio.sleep(1)
@@ -459,10 +478,12 @@ async def run_market_wss(state: BotState, client: ClobClient,
         asset_ids = [state.market.up_token_id, state.market.down_token_id]
         sub = json.dumps({"assets_ids": asset_ids, "type": "market",
                           "custom_feature_enabled": True})
+        log.info(f"[WSS] Connecting to {WSS_MARKET} for {state.market.slug}...")
+        log.info(f"[WSS] Subscribing to tokens: UP={state.market.up_token_id[:16]}... DOWN={state.market.down_token_id[:16]}...")
         try:
             async with websockets.connect(WSS_MARKET, ping_interval=None, open_timeout=10) as ws:
                 await ws.send(sub)
-                log.info(f"WSS connected: {state.market.slug}")
+                log.info(f"[WSS] ✅ Connected & subscribed: {state.market.slug}")
                 ping_t = asyncio.create_task(_wss_ping(ws, stop))
 
                 async for raw in ws:
@@ -480,6 +501,8 @@ async def run_market_wss(state: BotState, client: ClobClient,
                                 best_bid=float(ch.get("best_bid",0)),
                                 best_ask=float(ch.get("best_ask",1)),
                             ))
+                        if len(state.price_history) <= 3:
+                            log.info(f"[WSS] First price tick received! {len(state.price_history)} ticks so far")
 
                     elif etype == "best_bid_ask":
                         state.price_history.append(PriceTick(
@@ -544,10 +567,31 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             continue
 
         if not state.market:
+            # Poll for market every 15s — don't rely solely on WSS new_market event
+            now = int(time.time())
+            if not hasattr(state, '_last_market_scan') or now - state._last_market_scan > 15:
+                state._last_market_scan = now
+                log.info("[LOOP] No market loaded — polling Gamma API...")
+                m = await fetch_btc_market(session, now)
+                if m:
+                    state.market = enrich_market(client, m)
+                    log.info(f"[LOOP] ✅ Market loaded: {state.market.slug} | ends in {state.market.end_ts - now}s")
+                else:
+                    log.info("[LOOP] No market available yet — will retry in 15s")
             continue
 
         server_ts = int(client.get_server_time())
         time_left = state.market.end_ts - server_ts
+
+        # Log status every 10s
+        if int(time_left) % 10 == 0:
+            ups = [t.best_ask for t in state.price_history if t.token_id == state.market.up_token_id]
+            dns = [t.best_ask for t in state.price_history if t.token_id == state.market.down_token_id]
+            tick_count = len(state.price_history)
+            if ups and dns:
+                log.info(f"[STATUS] T-{time_left}s | UP={ups[-1]:.3f} DOWN={dns[-1]:.3f} | ticks={tick_count} | bal=${state.last_balance:.2f}")
+            else:
+                log.info(f"[STATUS] T-{time_left}s | waiting for price ticks... (received {tick_count} so far)")
 
         # ── Window expired ─────────────────────────────────────────────────
         if time_left <= 0:
