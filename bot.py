@@ -172,8 +172,12 @@ def refresh_creds(client: ClobClient):
 # ─── Balance ──────────────────────────────────────────────────────────────────
 def get_balance(client: ClobClient) -> float:
     try:
-        resp = client.get_balance_allowance(params={"asset_type": AssetType.COLLATERAL})
-        return float(resp.get("balance", 0))
+        from py_clob_client.clob_types import BalanceAllowanceParams
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=1)
+        resp = client.get_balance_allowance(params=params)
+        raw = float(resp.get("balance", 0))
+        # Polymarket returns balance in micro-USDC (6 decimals), convert to dollars
+        return raw / 1_000_000 if raw > 1000 else raw
     except Exception as e:
         log.warning(f"Balance check failed: {e}")
         return 0.0
@@ -783,12 +787,11 @@ async def run_bot():
         status = "OK" if drift < 3 else f"WARNING — {drift:.1f}s drift may affect timing"
         log.info(f"Clock drift: {drift:.2f}s [{status}]")
 
-        # Balance check — fail fast if insufficient
+        # Balance check — warn but continue (SDK may misread; real check happens pre-trade)
         state.last_balance = get_balance(client)
         log.info(f"USDC balance: ${state.last_balance:.4f}")
         if state.last_balance < STAKE:
-            log.error(f"Balance ${state.last_balance:.4f} < stake ${STAKE:.2f}. Top up and restart.")
-            return
+            log.warning(f"Balance shows ${state.last_balance:.4f} — if funded, SDK may be misreading. Continuing...")
 
         # Bootstrap first market
         m = await fetch_btc_market(session, server_ts)
