@@ -817,6 +817,21 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             if not state.trade_fired:
                 log.info("Window closed — no trade this cycle.")
                 _log_skip(state.market, "", 0, "no_signal", state.last_balance)
+
+            # If we have an open position at market close: launch background
+            # redeem task BEFORE wiping state. WSS market_resolved may arrive
+            # slightly late or be missed — we poll the Data API directly.
+            if state.position is not None:
+                pos = state.position
+                cid = pos.market.condition_id
+                bal_snap = state.last_balance
+                if cid:
+                    log.info(f"[REDEEM] Market closed with open position — launching background claim ({cid[:20]}...)")
+                    asyncio.create_task(
+                        _background_redeem(session, client, state, cid, pos,
+                                           0, 0, 0, bal_snap)
+                    )
+
             await _advance_market(client, session, state)
             continue
 
@@ -828,7 +843,7 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
                 await _advance_market(client, session, state)
                 continue
 
-            # Resolution came in via WSS
+            # Resolution came in via WSS before market close
             if state.resolved is not None:
                 await _resolve_position(client, session, state)
                 await _advance_market(client, session, state)
@@ -1023,174 +1038,152 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
 
 async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> bool:
     """
-    Redeem winning conditional tokens → USDC.
+    Redeem winning conditional tokens -> USDC via the Builder Relayer.
 
-    Requires Builder credentials from polymarket.com/settings?tab=builder:
-        BUILDER_KEY        = apiKey  (019cee25-... style)
-        BUILDER_SECRET     = secret  (2UOwKs0L... style)
-        BUILDER_PASSPHRASE = passphrase (b01dac48... style)
+    Step 1: Poll data-api.polymarket.com/positions to confirm the position
+            is actually redeemable (redeemable=true). This is the definitive
+            signal that the oracle has settled and the redeem will succeed.
 
-    These are separate from RELAYER_API_KEY — they come from the "Builder Codes"
-    tab in Polymarket settings. The relayer requires them to submit PROXY
-    transactions on your behalf.
+    Step 2: POST to relayer-v2.polymarket.com/execute/proxy using HMAC auth
+            (BUILDER_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE from env).
 
-    Uses poly-web3 + py-builder-relayer-client (installed via requirements.txt /
-    Dockerfile). Falls back to a clear error message if packages are missing.
+    These Builder credentials come from:
+        polymarket.com/settings?tab=builder -> Builder Codes -> Create New
+    They are different from Relayer API Keys.
     """
     import json as _json
 
     builder_key        = os.environ.get("BUILDER_KEY", "")
     builder_secret     = os.environ.get("BUILDER_SECRET", "")
     builder_passphrase = os.environ.get("BUILDER_PASSPHRASE", "")
+    funder             = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
 
     if not all([builder_key, builder_secret, builder_passphrase]):
         log.warning(
-            "[REDEEM] BUILDER_KEY / BUILDER_SECRET / BUILDER_PASSPHRASE not set. "
-            "Get them from polymarket.com/settings?tab=builder → Builder Codes. "
-            "Win will settle on-chain automatically within ~5 min."
+            "[REDEEM] Missing BUILDER_KEY/SECRET/PASSPHRASE — "
+            "get from polymarket.com/settings?tab=builder"
         )
         return False
 
     cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
     if len(cid) != 66:
-        log.error(f"[REDEEM] Invalid condition_id: {cid}")
+        log.error(f"[REDEEM] Bad condition_id length: {cid[:30]}")
         return False
 
-    # ── Strategy A: poly-web3 (the only verified working Python implementation) ──
-    try:
-        from py_builder_relayer_client.client import RelayClient
-        from py_builder_signing_sdk.config import BuilderConfig
-        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
-        from poly_web3 import RELAYER_URL as POLY_RELAYER_URL, PolyWeb3Service
+    # ── Step 1: verify position is redeemable via Data API ────────────────
+    if funder:
+        try:
+            async with session.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": funder.lower(), "sizeThreshold": "0.01"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                positions = await r.json()
+            redeemable = [p for p in (positions if isinstance(positions, list) else [])
+                          if p.get("redeemable") is True
+                          and p.get("conditionId", "").lower() == cid.lower()]
+            if not redeemable:
+                log.info(f"[REDEEM] Position not yet redeemable (oracle still settling)...")
+                return False
+            log.info(f"[REDEEM] ✅ Position confirmed redeemable: {redeemable[0].get('size','')} tokens")
+        except Exception as e:
+            log.warning(f"[REDEEM] Data API check failed ({e}), attempting redeem anyway...")
 
-        FUNDER = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
-        builder_cfg = BuilderConfig(
-            local_builder_creds=BuilderApiKeyCreds(
-                key=builder_key,
-                secret=builder_secret,
-                passphrase=builder_passphrase,
-            )
-        )
-        relay_client = RelayClient(
-            POLY_RELAYER_URL,
-            CHAIN_ID,
-            PRIVATE_KEY,       # EOA private key — RelayClient signs with this
-            builder_cfg,
-        )
+    # ── Step 2: encode redeemPositions calldata ───────────────────────────
+    # redeemPositions(address collateral, bytes32 parent, bytes32 conditionId, uint256[] indexSets)
+    # selector = keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[:4] = 9e2e3d85
+    CTF_ADDRESS  = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
+    USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    RELAYER_URL  = "https://relayer-v2.polymarket.com"
 
-        # Re-use the existing ClobClient for service init (it has right creds)
-        # We need a fresh one since we're outside the trading_loop scope
-        from py_clob_client.client import ClobClient as _ClobClient
-        _tmp_client = _ClobClient(
-            CLOB_HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
-            signature_type=1, funder=FUNDER,
-        )
-        _tmp_client.set_api_creds(_tmp_client.create_or_derive_api_creds())
+    usdc_pad    = USDC_ADDRESS.lower()[2:].zfill(64)
+    parent_zero = "00" * 32
+    cid_pad     = cid[2:].lower().zfill(64)
+    # dynamic array: offset=0x80 (128 bytes), length=2, values [1, 2]
+    calldata = ("0x9e2e3d85"
+                + usdc_pad
+                + parent_zero
+                + cid_pad
+                + "00" * 31 + "80"   # array offset
+                + "00" * 31 + "02"   # array length
+                + "00" * 31 + "01"   # indexSet 1
+                + "00" * 31 + "02")  # indexSet 2
 
-        service = PolyWeb3Service(clob_client=_tmp_client, relayer_client=relay_client)
-
-        log.info(f"[REDEEM] Calling poly_web3 service.redeem({cid[:20]}...)...")
-        result = service.redeem(condition_id=cid)
-        log.info(f"[REDEEM] ✅ Result: {result}")
-
-        state = (result or {}).get("state", "")
-        if state in ("STATE_CONFIRMED", "STATE_MINED", "STATE_EXECUTED", ""):
-            log.info(f"[REDEEM] ✅ Redemption submitted (state={state or 'submitted'})")
-            return True
-        else:
-            log.warning(f"[REDEEM] Unexpected state: {state}")
-            return False
-
-    except ImportError:
-        log.warning("[REDEEM] poly-web3 / py-builder-relayer-client not installed. "
-                    "Add them to requirements.txt and rebuild the container.")
-        pass
-    except Exception as exc:
-        log.warning(f"[REDEEM] poly-web3 redeem failed: {exc}")
-
-    # ── Strategy B: direct REST call to /submit (Builder API key auth) ──────────
-    # Only reached if poly-web3 raised an unexpected exception.
-    # Uses HMAC auth via py_builder_signing_sdk (already installed).
+    # ── Step 3: HMAC-sign and POST to /execute/proxy ──────────────────────
     try:
         from py_builder_signing_sdk.signing.hmac import build_hmac_signature
+    except ImportError:
+        log.error("[REDEEM] py_builder_signing_sdk not found — cannot sign request")
+        return False
 
-        CTF_ADDRESS  = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
-        USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-        RELAYER_URL  = "https://relayer-v2.polymarket.com"
+    body_obj  = {
+        "transactions": [{"to": CTF_ADDRESS, "data": calldata, "value": "0"}],
+        "metadata":     f"redeem {cid[:18]}",
+    }
+    body_str  = _json.dumps(body_obj, separators=(",", ":"))
+    path      = "/execute/proxy"
+    timestamp = str(int(time.time()))
 
-        # Manual ABI encode: redeemPositions(address,bytes32,bytes32,uint256[])
-        SELECTOR    = "9e2e3d85"
-        usdc_padded = USDC_ADDRESS.lower().replace("0x","").zfill(64)
-        parent_zero = "00" * 32
-        cid_padded  = cid[2:].lower().zfill(64)
-        arr_offset  = "00" * 31 + "80"
-        arr_len     = "00" * 31 + "02"
-        idx_1       = "00" * 31 + "01"
-        idx_2       = "00" * 31 + "02"
-        calldata    = ("0x" + SELECTOR + usdc_padded + parent_zero
-                       + cid_padded + arr_offset + arr_len + idx_1 + idx_2)
+    try:
+        signature = build_hmac_signature(builder_secret, timestamp, "POST", path, body_str)
+    except Exception as e:
+        log.error(f"[REDEEM] HMAC signing failed: {e}")
+        return False
 
-        body_obj = {
-            "transactions": [{"to": CTF_ADDRESS, "data": calldata, "value": "0"}],
-            "metadata": f"auto-redeem {cid[:18]}",
-        }
-        body_str  = _json.dumps(body_obj, separators=(",", ":"))
-        path      = "/execute/proxy"
-        timestamp = str(int(time.time()))
-        signature = build_hmac_signature(
-            builder_secret, timestamp, "POST", path, body_str
-        )
-        headers = {
-            "Content-Type":           "application/json",
-            "POLY_BUILDER_API_KEY":    builder_key,
-            "POLY_BUILDER_TIMESTAMP":  timestamp,
-            "POLY_BUILDER_PASSPHRASE": builder_passphrase,
-            "POLY_BUILDER_SIGNATURE":  signature,
-        }
+    headers = {
+        "Content-Type":           "application/json",
+        "POLY_BUILDER_API_KEY":   builder_key,
+        "POLY_BUILDER_TIMESTAMP": timestamp,
+        "POLY_BUILDER_PASSPHRASE": builder_passphrase,
+        "POLY_BUILDER_SIGNATURE": signature,
+    }
 
-        for attempt in range(1, 4):
-            log.info(f"[REDEEM] Strategy B: POST {RELAYER_URL}{path} (attempt {attempt}/3)...")
-            async with session.post(
-                f"{RELAYER_URL}{path}",
-                data=body_str,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                resp_text = await resp.text()
-                log.info(f"[REDEEM] HTTP {resp.status}: {resp_text[:200]}")
-                if resp.status not in (200, 201, 202):
-                    await asyncio.sleep(10)
-                    continue
-                resp_json = _json.loads(resp_text)
-                tx_id = resp_json.get("transactionID", "")
-                log.info(f"[REDEEM] Submitted tx_id={tx_id}")
+    try:
+        log.info(f"[REDEEM] POST {RELAYER_URL}{path} ...")
+        async with session.post(
+            f"{RELAYER_URL}{path}",
+            data=body_str,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            resp_text = await resp.text()
+            log.info(f"[REDEEM] HTTP {resp.status}: {resp_text[:300]}")
+            if resp.status not in (200, 201, 202):
+                return False
+            resp_json = _json.loads(resp_text)
+            tx_id     = resp_json.get("transactionID", "")
 
-            for poll in range(12):
-                await asyncio.sleep(5)
-                try:
-                    async with session.get(
-                        f"{RELAYER_URL}/transaction/{tx_id}",
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as pr:
-                        pd = await pr.json()
-                    state = pd.get("state", "")
-                    log.info(f"[REDEEM] Poll {poll+1}: state={state}")
-                    if state in ("STATE_CONFIRMED", "STATE_MINED", "STATE_EXECUTED"):
-                        log.info(f"[REDEEM] ✅ Redeemed on-chain (state={state})")
-                        return True
-                    if state in ("STATE_FAILED", "STATE_INVALID"):
-                        log.error(f"[REDEEM] ❌ {state}: {pd}")
-                        break
-                except Exception as pe:
-                    log.warning(f"[REDEEM] Poll error: {pe}")
+        if not tx_id:
+            log.warning("[REDEEM] No transactionID in response")
             return False
 
-    except Exception as exc:
-        log.error(f"[REDEEM] Strategy B also failed: {exc}")
+        # ── Step 4: poll for confirmation ────────────────────────────────
+        for poll in range(24):   # up to 120s
+            await asyncio.sleep(5)
+            try:
+                async with session.get(
+                    f"{RELAYER_URL}/transaction/{tx_id}",
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as pr:
+                    pd = await pr.json()
+                tx_state = pd.get("state", "")
+                log.info(f"[REDEEM] tx {tx_id[:12]}... state={tx_state} (poll {poll+1}/24)")
+                if tx_state in ("STATE_CONFIRMED", "STATE_MINED", "STATE_EXECUTED"):
+                    log.info(f"[REDEEM] ✅ On-chain redemption confirmed!")
+                    return True
+                if tx_state in ("STATE_FAILED", "STATE_INVALID"):
+                    log.error(f"[REDEEM] ❌ Transaction failed: {pd}")
+                    return False
+            except Exception as e:
+                log.warning(f"[REDEEM] Poll error: {e}")
 
-    log.warning("[REDEEM] All strategies failed. Win settles automatically within ~5 min.")
-    return False
+        log.warning("[REDEEM] Timed out waiting for tx confirmation")
+        return False
+
+    except Exception as e:
+        log.error(f"[REDEEM] Request failed: {e}")
+        return False
 
 
 async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, state: BotState):
@@ -1259,45 +1252,41 @@ async def _background_redeem(
       4. After each attempt, read balance — if it went up, we're done
       5. Give up after 10 minutes total
     """
-    INITIAL_WAIT_SEC = 180   # 3 min — oracle settlement time
-    POLL_INTERVAL    = 5     # seconds between retries
-    HARD_TIMEOUT     = 600   # 10 min total before giving up
+    # Start polling immediately — _auto_redeem now checks Data API internally
+    # and returns False (without calling the relayer) until the position is
+    # actually redeemable. So we can poll every 5s from the start.
+    POLL_INTERVAL = 5     # check every 5s
+    HARD_TIMEOUT  = 600   # give up after 10 min
 
-    log.info(f"[REDEEM] Waiting {INITIAL_WAIT_SEC}s for oracle to settle ({condition_id[:20]}...)...")
-    await asyncio.sleep(INITIAL_WAIT_SEC)
-
-    deadline   = time.time() + (HARD_TIMEOUT - INITIAL_WAIT_SEC)
+    log.info(f"[REDEEM] Background task started for {condition_id[:20]}... — polling every {POLL_INTERVAL}s")
+    deadline          = time.time() + HARD_TIMEOUT
     bal_before_redeem = get_balance(client)
-    attempt    = 0
+    attempt           = 0
 
     while time.time() < deadline:
         attempt += 1
-        log.info(f"[REDEEM] Attempt {attempt} — calling _auto_redeem...")
+        log.info(f"[REDEEM] Attempt {attempt} (T+{int(time.time()-deadline+HARD_TIMEOUT)}s elapsed)...")
         success = await _auto_redeem(session, condition_id)
 
-        # Read balance after each attempt
-        await asyncio.sleep(POLL_INTERVAL)
+        await asyncio.sleep(2)   # brief pause for balance to propagate
         bal_now = get_balance(client)
         state.last_balance = bal_now
-
         gained = bal_now - bal_before_redeem
-        log.info(f"[REDEEM] Balance check: ${bal_before_redeem:.4f} → ${bal_now:.4f} (gained ${gained:+.4f})")
+
+        log.info(f"[REDEEM] Balance: ${bal_before_redeem:.4f} → ${bal_now:.4f} (gained ${gained:+.4f})")
 
         if success or gained > 0.01:
-            log.info(f"[REDEEM] ✅ Redemption confirmed! New balance: ${bal_now:.4f}")
+            log.info(f"[REDEEM] ✅ CLAIMED! New balance: ${bal_now:.4f}")
             _save_resolved_trade(pos, "win", gained, gross, fee_usdc, net, bal_before, bal_now)
             return
 
-        if time.time() >= deadline:
-            break
-
-        log.info(f"[REDEEM] Not yet redeemable — retrying in {POLL_INTERVAL}s...")
+        log.info(f"[REDEEM] Not yet claimable — next check in {POLL_INTERVAL}s...")
         await asyncio.sleep(POLL_INTERVAL)
 
-    # Timed out — save trade with whatever balance we have now
+    # Timed out
     bal_final = get_balance(client)
     state.last_balance = bal_final
-    log.warning(f"[REDEEM] ⚠️ Timed out after {HARD_TIMEOUT}s. Balance: ${bal_final:.4f}. Claim manually.")
+    log.warning(f"[REDEEM] ⚠️ 10 min timeout. Balance: ${bal_final:.4f}. Claim manually on Polymarket.")
     _save_resolved_trade(pos, "win", bal_final - bal_before, gross, fee_usdc, net, bal_before, bal_final)
 
 
