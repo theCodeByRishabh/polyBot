@@ -428,14 +428,18 @@ def get_signal(market: Market, history: deque, consecutive_losses: int) -> Optio
 
 # ─── Entry filters ────────────────────────────────────────────────────────────
 def spread_ok(history: deque, token_id: str) -> bool:
+    """
+    At extreme prices (>= 0.97) the spread naturally widens because the
+    losing side has almost no value — allow up to 0.05 instead of 0.03.
+    """
     recent = [t for t in history if t.token_id == token_id]
     if not recent: return False
     t = recent[-1]
     spread = t.best_ask - t.best_bid
-    ok = spread <= MAX_SPREAD
-    log.info(f"  Spread: bid={t.best_bid:.4f} ask={t.best_ask:.4f} spread={spread:.4f} ({'ok' if ok else 'WIDE'})")
+    max_spread = 0.05 if t.best_ask >= 0.97 else MAX_SPREAD
+    ok = spread <= max_spread
+    log.info(f"  Spread: bid={t.best_bid:.4f} ask={t.best_ask:.4f} spread={spread:.4f} max={max_spread:.2f} ({'ok' if ok else 'WIDE'})")
     return ok
-
 def volume_surge(trade_history: deque, token_id: str) -> bool:
     """Returns True (skip) if recent 30s volume is 3x the prior 30s."""
     now    = time.time()
@@ -448,15 +452,40 @@ def volume_surge(trade_history: deque, token_id: str) -> bool:
     return surge
 
 async def liquidity_ok(session: aiohttp.ClientSession, token_id: str, price: float) -> bool:
+    """
+    Check ask-side liquidity depth.
+
+    When price >= 0.99 the book is nearly settled — sellers disappear because
+    there is nothing left to gain by offering the losing side.  At that point
+    requiring $3 of ask depth would block every high-confidence trade.
+    We scale the threshold down linearly so that:
+      price < 0.97  → require MIN_LIQUIDITY ($3.00)
+      price = 0.99  → require $1.00
+      price = 1.00  → require $0.10 (essentially just "any offer exists")
+    We also widen the ask-price window from +0.01 to +0.02 at high prices
+    because the spread can legitimately be a tick or two wider near certainty.
+    """
     try:
         async with session.get(f"{CLOB_HOST}/book", params={"token_id": token_id},
                                timeout=aiohttp.ClientTimeout(total=3)) as r:
             if r.status == 200:
-                book  = await r.json()
-                depth = sum(float(a["size"]) * float(a["price"])
-                            for a in book.get("asks",[]) if float(a["price"]) <= price + 0.01)
-                ok = depth >= MIN_LIQUIDITY
-                log.info(f"  Liquidity: ${depth:.2f} ({'ok' if ok else 'THIN'})")
+                book = await r.json()
+                window = 0.02 if price >= 0.97 else 0.01
+                depth  = sum(float(a["size"]) * float(a["price"])
+                             for a in book.get("asks", [])
+                             if float(a["price"]) <= price + window)
+
+                # Scale minimum liquidity: full requirement below 0.97,
+                # tapering to $0.10 at price=1.00
+                if price >= 0.97:
+                    # linear interpolation: 0.97→MIN_LIQUIDITY, 1.00→0.10
+                    t         = (price - 0.97) / 0.03          # 0..1
+                    min_depth = MIN_LIQUIDITY * (1 - t) + 0.10 * t
+                else:
+                    min_depth = MIN_LIQUIDITY
+
+                ok = depth >= min_depth
+                log.info(f"  Liquidity: ${depth:.2f} (min=${min_depth:.2f}) ({'ok' if ok else 'THIN'})")
                 return ok
     except Exception as e:
         log.warning(f"Liquidity check: {e}")
@@ -801,7 +830,7 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
 
             # Resolution came in via WSS
             if state.resolved is not None:
-                await _resolve_position(client, state)
+                await _resolve_position(client, session, state)
                 await _advance_market(client, session, state)
                 continue
 
@@ -973,27 +1002,27 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
     ))
     return
 
-async def _auto_redeem(condition_id: str) -> bool:
+async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> bool:
     """
-    Redeem winning conditional tokens back to USDC via the Builder Relayer.
+    Redeem winning conditional tokens → USDC via the Polymarket Builder Relayer.
 
-    Requires three env vars set in .env:
-        BUILDER_KEY        - your Builder API key
-        BUILDER_SECRET     - your Builder secret
-        BUILDER_PASSPHRASE - your Builder passphrase
+    Uses only aiohttp (already installed) + py_builder_signing_sdk (already installed).
+    No extra packages required.
 
-    These come from your Polymarket Builder account. The bot uses a Proxy
-    wallet (signature_type=1), so we use RelayerTxType.PROXY.
+    The relayer REST API:
+        POST https://relayer-v2.polymarket.com/execute/proxy
+        Headers: POLY_BUILDER_API_KEY, POLY_BUILDER_TIMESTAMP,
+                 POLY_BUILDER_PASSPHRASE, POLY_BUILDER_SIGNATURE
+        Body:    { "transactions": [{"to": ..., "data": ..., "value": "0"}],
+                   "metadata": "..." }
 
-    Contract addresses (Polygon mainnet):
-        CTF:  0x4d97dcd97ec945f40cf65f87097ace5ea0476045
-        USDC: 0x2791bca1f2de4661ed88a30c99a7a9449aa84174
+    HMAC signature covers: timestamp + "POST" + "/execute/proxy" + body_json
+    Secret is base64url-encoded.
 
-    parentCollectionId must be bytes32(0) for CLOB tokens (not NegRisk Adapter).
-    indexSets = [1, 2] redeems both outcome slots at once.
-
-    redeemPositions selector: keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
-    = 0x9e2e3d85
+    redeemPositions(address collateral, bytes32 parent, bytes32 conditionId, uint256[] indexSets)
+    selector = keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[:4] = 0x9e2e3d85
+    parentCollectionId = bytes32(0)  ← required for CLOB tokens; NegRisk adapter uses different IDs
+    indexSets = [1, 2]               ← redeem both outcome slots
     """
     builder_key        = os.environ.get("BUILDER_KEY", "")
     builder_secret     = os.environ.get("BUILDER_SECRET", "")
@@ -1001,97 +1030,116 @@ async def _auto_redeem(condition_id: str) -> bool:
 
     if not all([builder_key, builder_secret, builder_passphrase]):
         log.warning(
-            "[REDEEM] Builder credentials missing (BUILDER_KEY / BUILDER_SECRET / "
-            "BUILDER_PASSPHRASE). Win will settle on-chain automatically within ~5 min. "
-            "Add credentials to .env to enable instant auto-redeem."
+            "[REDEEM] BUILDER_KEY / BUILDER_SECRET / BUILDER_PASSPHRASE not set. "
+            "Wins settle automatically on-chain within ~5 min — or claim via Polymarket UI. "
+            "Set these env vars to enable instant auto-redeem."
         )
         return False
 
-    try:
-        from py_builder_relayer_client.client import RelayClient
-        from py_builder_relayer_client.types import OperationType, RelayerTxType
-        from py_builder_signing_sdk.config import BuilderConfig
-        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
-        from eth_abi import encode as abi_encode
-    except ImportError as exc:
-        log.warning(f"[REDEEM] Missing package ({exc}). Run: pip install py-builder-relayer-client eth-abi")
-        return False
-
-    CTF_ADDRESS   = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
-    USDC_ADDRESS  = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
-    RELAYER_URL   = "https://relayer-v2.polymarket.com/"
-    # redeemPositions(address,bytes32,bytes32,uint256[]) selector
-    SELECTOR_HEX  = "9e2e3d85"
-    PARENT_ZERO   = "0x" + "00" * 32
-    INDEX_SETS    = [1, 2]
-
-    # Normalise condition_id to 0x-prefixed 32-byte hex
+    # ── Normalise condition_id ─────────────────────────────────────────────
     cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
     if len(cid) != 66:
-        log.error(f"[REDEEM] Invalid condition_id length ({len(cid)} chars, expected 66): {cid}")
+        log.error(f"[REDEEM] Invalid condition_id (len={len(cid)}, expected 66): {cid}")
         return False
 
-    try:
-        cid_bytes    = bytes.fromhex(cid[2:])
-        parent_bytes = bytes(32)
-        params_hex   = abi_encode(
-            ["address", "bytes32", "bytes32", "uint256[]"],
-            [USDC_ADDRESS, parent_bytes, cid_bytes, INDEX_SETS],
-        ).hex()
-        calldata = "0x" + SELECTOR_HEX + params_hex
-    except Exception as exc:
-        log.error(f"[REDEEM] ABI encoding failed: {exc}")
-        return False
+    # ── ABI-encode redeemPositions calldata ───────────────────────────────
+    # Manual ABI encoding (no external lib needed):
+    # redeemPositions(address, bytes32, bytes32, uint256[])
+    # = selector(4) + address(32) + bytes32(32) + bytes32(32) + offset(32) + len(32) + [1,2](64)
+    CTF_ADDRESS  = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
+    USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    SELECTOR     = "9e2e3d85"
 
-    tx = {
-        "to":        CTF_ADDRESS,
-        "data":      calldata,
-        "value":     "0",
-        "operation": OperationType.Call,
+    usdc_padded   = USDC_ADDRESS.lower().replace("0x", "").zfill(64)
+    parent_padded = "00" * 32
+    cid_padded    = cid[2:].lower().zfill(64)
+    # dynamic array: offset=128 (0x80), length=2, values 1 and 2
+    array_offset  = "00" * 31 + "80"
+    array_len     = "00" * 31 + "02"
+    index_1       = "00" * 31 + "01"
+    index_2       = "00" * 31 + "02"
+    calldata = ("0x" + SELECTOR + usdc_padded + parent_padded
+                + cid_padded + array_offset + array_len + index_1 + index_2)
+
+    # ── Build request body ─────────────────────────────────────────────────
+    body_obj = {
+        "transactions": [{"to": CTF_ADDRESS, "data": calldata, "value": "0"}],
+        "metadata": f"auto-redeem {cid[:18]}",
+    }
+    import json as _json
+    body_str = _json.dumps(body_obj, separators=(",", ":"))
+
+    # ── Build HMAC headers ────────────────────────────────────────────────
+    # Signature = HMAC-SHA256(base64url_decode(secret),
+    #             timestamp + "POST" + path + body)
+    from py_builder_signing_sdk.signing.hmac import build_hmac_signature
+    path      = "/execute/proxy"
+    timestamp = str(int(time.time()))
+    signature = build_hmac_signature(builder_secret, timestamp, "POST", path, body_str)
+
+    headers = {
+        "Content-Type":          "application/json",
+        "POLY_BUILDER_API_KEY":   builder_key,
+        "POLY_BUILDER_TIMESTAMP": timestamp,
+        "POLY_BUILDER_PASSPHRASE": builder_passphrase,
+        "POLY_BUILDER_SIGNATURE":  signature,
     }
 
-    try:
-        builder_cfg = BuilderConfig(
-            local_builder_creds=BuilderApiKeyCreds(
-                key=builder_key,
-                secret=builder_secret,
-                passphrase=builder_passphrase,
-            )
-        )
-        # Proxy wallet = signature_type 1 → RelayerTxType.PROXY
-        relay = RelayClient(
-            RELAYER_URL,
-            CHAIN_ID,
-            PRIVATE_KEY,
-            builder_cfg,
-            RelayerTxType.PROXY,
-        )
-    except Exception as exc:
-        log.error(f"[REDEEM] RelayClient init failed: {exc}")
-        return False
+    RELAYER_URL = "https://relayer-v2.polymarket.com"
 
+    # ── Submit + poll ─────────────────────────────────────────────────────
     for attempt in range(1, 4):
         try:
-            log.info(f"[REDEEM] Submitting redeemPositions via relayer (attempt {attempt}/3)...")
-            resp    = relay.execute([tx], f"auto-redeem condition {cid[:18]}...")
-            receipt = resp.wait()
-            state_val = getattr(receipt, "state", None) if receipt else None
-            # Accept both mined and confirmed states
-            if state_val in ("STATE_MINED", "STATE_CONFIRMED", 3, 4):
-                log.info(f"[REDEEM] Redemption confirmed on-chain (state={state_val}) ✅")
-                return True
-            log.warning(f"[REDEEM] Attempt {attempt} finished with state={state_val} — retrying in 10s...")
-            await asyncio.sleep(10)
+            log.info(f"[REDEEM] POST {RELAYER_URL}{path} (attempt {attempt}/3)...")
+            async with session.post(
+                f"{RELAYER_URL}{path}",
+                data=body_str,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                resp_text = await resp.text()
+                if resp.status not in (200, 201, 202):
+                    log.warning(f"[REDEEM] HTTP {resp.status}: {resp_text[:200]}")
+                    await asyncio.sleep(10)
+                    continue
+
+                resp_json = _json.loads(resp_text)
+                tx_id = resp_json.get("transactionID") or resp_json.get("id", "")
+                log.info(f"[REDEEM] Transaction submitted: id={tx_id}")
+
+            # ── Poll for confirmation ──────────────────────────────────────
+            if tx_id:
+                for poll in range(12):   # up to ~60s
+                    await asyncio.sleep(5)
+                    try:
+                        async with session.get(
+                            f"{RELAYER_URL}/transaction/{tx_id}",
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as pr:
+                            pd = await pr.json()
+                            state = pd.get("state", "")
+                            log.info(f"[REDEEM] Poll {poll+1}: state={state}")
+                            if state in ("STATE_CONFIRMED", "STATE_MINED"):
+                                log.info(f"[REDEEM] ✅ Redeemed on-chain (state={state})")
+                                return True
+                            if state in ("STATE_FAILED", "STATE_INVALID"):
+                                log.error(f"[REDEEM] Transaction {state}: {pd}")
+                                break
+                    except Exception as pe:
+                        log.warning(f"[REDEEM] Poll error: {pe}")
+            return False
+
         except Exception as exc:
             log.warning(f"[REDEEM] Attempt {attempt} error: {exc}")
             if attempt < 3:
                 await asyncio.sleep(10)
 
-    log.warning("[REDEEM] All relayer attempts failed. Win settles automatically within ~5 min.")
+    log.warning("[REDEEM] All attempts failed. Win settles automatically within ~5 min.")
     return False
 
 
-async def _resolve_position(client: ClobClient, state: BotState):
+async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, state: BotState):
     """Called when WSS market_resolved arrives. Determines win/loss and redeems if won."""
     pos  = state.position
     won  = (state.resolved == pos.token_id)
@@ -1104,7 +1152,7 @@ async def _resolve_position(client: ClobClient, state: BotState):
         if cid:
             log.info(f"[REDEEM] WIN — auto-redeeming condition_id={cid[:20]}...")
             await asyncio.sleep(5)          # let oracle fully settle before redeem call
-            await _auto_redeem(cid)
+            await _auto_redeem(session, cid)
             await asyncio.sleep(5)          # let balance propagate before reading it
         else:
             log.warning("[REDEEM] WIN but condition_id is empty — cannot auto-redeem. Claim manually.")
