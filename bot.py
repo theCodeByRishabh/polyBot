@@ -35,7 +35,7 @@ from typing import Optional
 import aiohttp
 import websockets
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import AssetType, OrderArgs, OrderType, BalanceAllowanceParams
+from py_clob_client.clob_types import AssetType, OrderArgs, MarketOrderArgs, OrderType, BalanceAllowanceParams
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -443,8 +443,8 @@ def volume_surge(trade_history: deque, token_id: str) -> bool:
     older  = sum(t.size for t in trade_history if t.token_id == token_id and 30 < now - t.ts <= 60)
     if older == 0: return False
     ratio = recent / older
-    surge = ratio > 3.0
-    log.info(f"  Volume momentum: recent={recent:.1f} older={older:.1f} ratio={ratio:.1f} {'SURGE' if surge else 'ok'}")
+    surge = ratio > 8.0  # Raised from 3.0 — at 95%+ threshold, high volume is expected
+    log.info(f"  Volume momentum: recent={recent:.1f} older={older:.1f} ratio={ratio:.1f} {'SURGE-SKIP' if surge else 'ok'}")
     return surge
 
 async def liquidity_ok(session: aiohttp.ClientSession, token_id: str, price: float) -> bool:
