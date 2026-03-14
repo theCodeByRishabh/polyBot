@@ -53,6 +53,10 @@ CLOB_HOST       = "https://clob.polymarket.com"
 GAMMA_API       = "https://gamma-api.polymarket.com"
 WSS_MARKET      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CHAIN_ID        = 137
+CTF_CONTRACT    = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+USDC_E          = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+PARENT_COLLECTION_ID = "0x" + ("00" * 32)
+RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RELAYER_URL") or "https://relayer-v2.polymarket.com/"
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
 STAKE             = 5.00    # Fixed $5.00 per trade (min 5 shares at 0.93+ price)
@@ -1036,13 +1040,125 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
     ))
     return
 
+def _builder_creds():
+    key = (os.environ.get("BUILDER_KEY")
+           or os.environ.get("BUILDER_API_KEY")
+           or os.environ.get("POLY_BUILDER_API_KEY"))
+    secret = os.environ.get("BUILDER_SECRET") or os.environ.get("POLY_BUILDER_SECRET")
+    passphrase = (os.environ.get("BUILDER_PASSPHRASE")
+                  or os.environ.get("BUILDER_PASS_PHRASE")
+                  or os.environ.get("POLY_BUILDER_PASSPHRASE"))
+    if not (key and secret and passphrase):
+        return None
+    return key, secret, passphrase
+
+def _to_bytes32(hex_str: str) -> bytes:
+    h = (hex_str or "").lower()
+    if h.startswith("0x"):
+        h = h[2:]
+    if len(h) > 64:
+        raise ValueError("hex too long for bytes32")
+    return bytes.fromhex(h.zfill(64))
+
+def _encode_redeem_positions(condition_id: str) -> Optional[str]:
+    try:
+        from eth_utils import keccak, to_checksum_address
+        from eth_abi import encode
+    except Exception as e:
+        log.warning(f"[REDEEM] ABI encoder unavailable: {e}")
+        return None
+
+    try:
+        selector = keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+        args = encode(
+            ["address", "bytes32", "bytes32", "uint256[]"],
+            [
+                to_checksum_address(USDC_E),
+                _to_bytes32(PARENT_COLLECTION_ID),
+                _to_bytes32(condition_id),
+                [1, 2],
+            ],
+        )
+        return "0x" + (selector + args).hex()
+    except Exception as e:
+        log.warning(f"[REDEEM] Encode redeemPositions failed: {e}")
+        return None
+
+def _redeem_via_relayer(condition_id: str) -> bool:
+    if not condition_id:
+        log.warning("[REDEEM] condition_id missing - cannot redeem.")
+        return False
+
+    creds = _builder_creds()
+    if not creds:
+        log.warning("[REDEEM] Builder creds missing (BUILDER_KEY/SECRET/PASSPHRASE).")
+        return False
+
+    try:
+        from py_builder_relayer_client.client import RelayClient
+        from py_builder_relayer_client.models import Transaction, RelayerTxType
+        from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
+    except Exception as e:
+        log.warning(f"[REDEEM] Relayer SDK unavailable: {e}")
+        return False
+
+    data = _encode_redeem_positions(condition_id)
+    if not data:
+        return False
+
+    key, secret, passphrase = creds
+    rpc_url = os.environ.get("POLYGON_RPC_URL") or os.environ.get("RPC_URL")
+    try:
+        builder_config = BuilderConfig(local_builder_creds=BuilderApiKeyCreds(
+            key=key, secret=secret, passphrase=passphrase
+        ))
+        relay_tx_type = RelayerTxType.SAFE
+        client = RelayClient(
+            RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config,
+            relay_tx_type=relay_tx_type, rpc_url=rpc_url
+        )
+        funder = (FUNDER_ADDRESS or "").lower()
+
+        try:
+            expected_safe = client.get_expected_safe()
+        except Exception:
+            expected_safe = None
+        try:
+            expected_proxy = client.get_expected_proxy_wallet()
+        except Exception:
+            expected_proxy = None
+
+        if expected_proxy and funder == expected_proxy.lower():
+            relay_tx_type = RelayerTxType.PROXY
+        elif expected_safe and funder == expected_safe.lower():
+            relay_tx_type = RelayerTxType.SAFE
+
+        if relay_tx_type != client.relay_tx_type:
+            client = RelayClient(
+                RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config,
+                relay_tx_type=relay_tx_type, rpc_url=rpc_url
+            )
+
+        tx = Transaction(
+            to=CTF_CONTRACT,
+            data=data,
+            value="0",
+        )
+        resp = client.execute([tx], "Redeem positions")
+        log.info(f"[REDEEM] Relayer submitted: {resp}")
+        try:
+            result = resp.wait()
+            log.info(f"[REDEEM] Relayer result: {result}")
+        except Exception as e:
+            log.info(f"[REDEEM] Relayer wait failed (continuing): {e}")
+        return True
+    except Exception as e:
+        log.warning(f"[REDEEM] Relayer redeem failed: {e}")
+        return False
+
 async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> bool:
     """
     Check whether the winning position is redeemable via the Polymarket Data API.
-
-    Polymarket auto-settles all winning positions on-chain within ~2-3 minutes
-    of market resolution. The USDC arrives in the proxy wallet automatically —
-    we do NOT need to call the Builder Relayer at all.
 
     What this function does:
       1. Calls data-api.polymarket.com/positions?user=<proxy> and looks for
@@ -1050,13 +1166,9 @@ async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> boo
       2. Returns True if found (prize is already settled / being settled).
       3. Returns False if not yet redeemable (oracle still confirming).
 
-    The caller (_background_redeem) then reads the CLOB balance every 5s
-    and considers the claim complete once balance increases.
-
-    Builder credentials (BUILDER_KEY etc.) are NOT required for this approach.
-    If you have an approved Builder account you can install poly-web3 and
-    py-builder-relayer-client for instant redemption, but auto-settlement
-    works reliably without them.
+    The caller (_background_redeem) then attempts to redeem via the relayer
+    when redeemable=True (if builder credentials are available), and keeps
+    polling the balance until USDC arrives.
     """
     funder = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
 
@@ -1175,6 +1287,7 @@ async def _background_redeem(
     bal_before_redeem = get_balance(client)
     attempt           = 0
 
+    relayer_sent = False
     while time.time() < deadline:
         attempt += 1
         log.info(f"[REDEEM] Attempt {attempt} (T+{int(time.time()-deadline+HARD_TIMEOUT)}s elapsed)...")
@@ -1194,9 +1307,15 @@ async def _background_redeem(
             return
 
         if success:
-            # redeemable=True confirmed — Polymarket auto-settlement in progress.
+            # redeemable=True confirmed — submit a relayer redeem once.
+            if not relayer_sent:
+                relayer_sent = _redeem_via_relayer(condition_id)
+                if relayer_sent:
+                    log.info("[REDEEM] Relayer redeem submitted — waiting for USDC to arrive...")
+                else:
+                    log.info("[REDEEM] Relayer redeem not submitted — will keep polling balance.")
+
             # Keep polling balance every 5s until USDC arrives (usually within 30s).
-            log.info(f"[REDEEM] redeemable=True confirmed — waiting for USDC to arrive...")
             for wait in range(24):  # up to 2 more minutes
                 await asyncio.sleep(5)
                 bal_now = get_balance(client)
