@@ -78,7 +78,7 @@ PARENT_COLLECTION_ID = "0x" + ("00" * 32)
 RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RELAYER_URL") or "https://relayer-v2.polymarket.com/"
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-STAKE             = 5.00    # Fixed $5.00 per trade (min 5 shares at 0.93+ price)
+STAKE             = 6.00    # Fixed $5.00 per trade (min 5 shares at 0.93+ price)
 BASE_THRESHOLD    = 0.93    # Buy when dominant side ask >= 93%
 ADAPTIVE_THRESH   = 0.97    # Raised after 2 consecutive losses
 ENTRY_WINDOW_SEC  = 30      # Enter any time price >= threshold AND <=30s remain
@@ -1160,9 +1160,17 @@ def _redeem_via_relayer(condition_id: str) -> bool:
             key=key, secret=secret, passphrase=passphrase
         ))
         relay_tx_type = RelayerTxType.SAFE
+        import inspect
+        sig = inspect.signature(RelayClient.__init__)
+        kwargs = {}
+        if "relay_tx_type" in sig.parameters:
+            kwargs["relay_tx_type"] = relay_tx_type
+        if "rpc_url" in sig.parameters:
+            kwargs["rpc_url"] = rpc_url
+
         client = RelayClient(
             RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config,
-            relay_tx_type=relay_tx_type, rpc_url=rpc_url
+            **kwargs
         )
         funder = (FUNDER_ADDRESS or "").lower()
 
@@ -1180,10 +1188,12 @@ def _redeem_via_relayer(condition_id: str) -> bool:
         elif expected_safe and funder == expected_safe.lower():
             relay_tx_type = RelayerTxType.SAFE
 
-        if relay_tx_type != client.relay_tx_type:
+        if getattr(client, "relay_tx_type", None) != relay_tx_type:
+            if "relay_tx_type" in sig.parameters:
+                kwargs["relay_tx_type"] = relay_tx_type
             client = RelayClient(
                 RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config,
-                relay_tx_type=relay_tx_type, rpc_url=rpc_url
+                **kwargs
             )
 
         tx = TransactionCls(
@@ -1297,13 +1307,24 @@ def _redeem_direct(condition_id: str) -> bool:
             return False
 
         nonce = w3.eth.get_transaction_count(account.address)
+        gas_limit = 250000
+        gas_price = int(w3.eth.gas_price * 1.2)
+        total_cost = gas_limit * gas_price
+        
+        balance = w3.eth.get_balance(account.address)
+        if balance < total_cost:
+            matic_needed = w3.from_wei(total_cost, 'ether')
+            matic_balance = w3.from_wei(balance, 'ether')
+            log.warning(f"[REDEEM DIRECT] Insufficient MATIC. Need {matic_needed} MATIC, but have {matic_balance} MATIC. Fund: {account.address}")
+            return False
+
         tx = {
             'nonce': nonce,
             'to': CTF_CONTRACT,
             'data': data,
             'value': 0,
-            'gas': 250000,
-            'gasPrice': int(w3.eth.gas_price * 1.2),
+            'gas': gas_limit,
+            'gasPrice': gas_price,
             'chainId': CHAIN_ID,
         }
         signed_tx = account.sign_transaction(tx)
