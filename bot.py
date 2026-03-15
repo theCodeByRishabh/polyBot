@@ -102,7 +102,7 @@ RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RE
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
 STAKE             = 6.00    # Fixed $5.00 per trade (min 5 shares at 0.93+ price)
-BASE_THRESHOLD    = 0.97   # Buy when dominant side ask >= 93%
+BASE_THRESHOLD    = 0.94   # Buy when dominant side ask >= 93%
 ADAPTIVE_THRESH   = 0.98    # Raised after 2 consecutive losses
 ENTRY_WINDOW_SEC  = 30      # Enter any time price >= threshold AND <=30s remain
 PRESIGN_BEFORE    = 40      # Build signed order at T-40s (removes signing latency)
