@@ -81,12 +81,22 @@ from py_clob_client.clob_types import AssetType, OrderArgs, MarketOrderArgs, Ord
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")],
-)
-log = logging.getLogger("polybot")
+import logging.handlers as _lh
+
+def _make_logger():
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    sh  = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    # Rotate at 5 MB, keep 2 files — total max ~10 MB, covers ~3h of typical log volume
+    fh = _lh.RotatingFileHandler("bot.log", maxBytes=5*1024*1024, backupCount=2)
+    fh.setFormatter(fmt)
+    logger = logging.getLogger("polybot")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(sh)
+    logger.addHandler(fh)
+    return logger
+
+log = _make_logger()
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 PRIVATE_KEY     = os.environ["POLYMARKET_PRIVATE_KEY"]
@@ -192,6 +202,7 @@ class BotState:
     presigned_order: object       = None
     presigned_for: Optional[str]  = None
     consecutive_losses: int       = 0
+    consecutive_wins: int         = 0   # resets consecutive_losses after 5 wins
     exchange_disabled: bool       = False
     last_balance: float           = 0.0
     # Clock sync — proper fields instead of monkey-patched attrs
@@ -248,16 +259,22 @@ def build_client() -> ClobClient:
             delay = min(delay * 2, 60)
 
 # ─── Balance ──────────────────────────────────────────────────────────────────
-def get_balance(client: ClobClient) -> float:
-    try:
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=1)
-        resp = client.get_balance_allowance(params=params)
-        raw = float(resp.get("balance", 0))
-        # Polymarket returns balance in micro-USDC (6 decimals), convert to dollars
-        return raw / 1_000_000 if raw > 1000 else raw
-    except Exception as e:
-        log.warning(f"Balance check failed: {e}")
-        return 0.0
+def get_balance(client: ClobClient, retries: int = 3) -> float:
+    """Fetch USDC balance with up to `retries` attempts. Returns 0.0 only if all fail."""
+    for attempt in range(1, retries + 1):
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=1)
+            resp = client.get_balance_allowance(params=params)
+            raw = float(resp.get("balance", 0))
+            # Polymarket returns balance in micro-USDC (6 decimals), convert to dollars
+            return raw / 1_000_000 if raw > 1000 else raw
+        except Exception as e:
+            if attempt < retries:
+                log.warning(f"Balance check failed (attempt {attempt}/{retries}): {e} — retrying...")
+                time.sleep(0.5)
+            else:
+                log.warning(f"Balance check failed after {retries} attempts: {e} — returning 0.0")
+    return 0.0
 
 # ─── Error classification & retry ─────────────────────────────────────────────
 class ExchangeDisabledError(Exception): pass
@@ -954,9 +971,12 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
                     log.info("[LOOP] No market available yet — will retry in 15s")
             continue
 
-        # Use local clock + server offset — sync with server every 30s instead of every second
-        now_local = time.time()
-        if now_local - state.last_sync > 30:
+        # Use local clock + server offset.
+        # Sync every 10s during entry window (time-critical), every 30s otherwise.
+        now_local   = time.time()
+        in_window   = state.market and MIN_FIRE_BUFFER < (state.market.end_ts - int(now_local + state.clock_offset)) <= ENTRY_WINDOW_SEC
+        sync_interval = 10 if in_window else 30
+        if now_local - state.last_sync > sync_interval:
             try:
                 server_ts_raw = int(await asyncio.to_thread(client.get_server_time))
                 state.clock_offset = server_ts_raw - now_local
@@ -1048,18 +1068,15 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             side, token_id, price = signal
             log.info(f"SIGNAL @ T-{time_left}s: BTC {side.upper()} ask={price:.4f}")
 
-            # Gate 1: spread
+            # Gate 1: spread — retry each tick, don't permanently skip
+            # Spread can widen temporarily then narrow back within the 30s window
             if not spread_ok(state.price_history, token_id):
-                log.info("Skip: wide spread")
-                state.trade_fired = True
-                _log_skip(state.market, side, price, "wide_spread", state.last_balance)
+                log.info(f"  T-{time_left}s: wide spread — will retry next tick...")
                 continue
 
-            # Gate 2: volume surge
+            # Gate 2: volume surge — retry each tick, don't permanently skip
             if volume_surge(state.trade_history, token_id):
-                log.info("Skip: volume surge")
-                state.trade_fired = True
-                _log_skip(state.market, side, price, "volume_surge", state.last_balance)
+                log.info(f"  T-{time_left}s: volume surge — will retry next tick...")
                 continue
 
             # Gate 3: liquidity — retry every loop tick until window closes,
@@ -1746,7 +1763,15 @@ async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, 
     payout, gross, fee_usdc, net = calc_profit(STAKE, pos.entry_price, 1.0, fee_bps, outcome)
 
     bal_before = state.last_balance
-    state.consecutive_losses = 0 if won else state.consecutive_losses + 1
+    if won:
+        state.consecutive_wins  += 1
+        if state.consecutive_wins >= 5:
+            state.consecutive_losses = 0
+            state.consecutive_wins   = 0
+            log.info("[STREAK] 5 consecutive wins — adaptive threshold reset to base.")
+    else:
+        state.consecutive_losses += 1
+        state.consecutive_wins   = 0
 
     log.info(f"{'WIN ✅' if won else 'LOSS ❌'}: gross={gross:+.4f} fee={fee_usdc:.5f} net={net:+.4f}")
 
@@ -1913,6 +1938,7 @@ async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
     fee_bps = float(state.market.fee_rate or 0)
     payout, gross, fee_usdc, net = calc_profit(STAKE, pos.entry_price, actual_exit, fee_bps, "stop_loss")
     state.consecutive_losses += 1
+    state.consecutive_wins   = 0
 
     log.info(f"✅ STOP-LOSS executed: entry={pos.entry_price:.4f} exit={actual_exit:.4f} | "
              f"gross={gross:+.4f} net={net:+.4f} | balance ${bal_before:.4f} → ${bal_after:.4f}")
@@ -1950,7 +1976,7 @@ async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, st
     except Exception:
         server_ts = int(time.time() + state.clock_offset)
     state.trade_fired      = False
-    state.resolved         = None
+    state.resolved         = None   # cleared here — never carry over to next market
     state.presigned_order  = None
     state.presigned_for    = None
     state.position         = None  # always clear position on advance

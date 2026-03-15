@@ -21,36 +21,74 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 from collections import defaultdict
 
-TRADES_FILE = Path("trades.json")
-DASH_USER   = os.environ.get("DASH_USER", "admin")
-DASH_PASS   = os.environ.get("DASH_PASS", "changeme")
-PORT        = int(os.environ.get("DASH_PORT", "8080"))
-SESSION_TTL = 3600
-STAKE       = float(os.environ.get("BOT_STAKE", "6.00"))
+TRADES_FILE   = Path("trades.json")
+SESSIONS_FILE = Path("sessions.json")   # persisted across restarts/crashes/redeploys
+DASH_USER     = os.environ.get("DASH_USER", "admin")
+DASH_PASS     = os.environ.get("DASH_PASS", "changeme")
+PORT          = int(os.environ.get("DASH_PORT", "8080"))
+SESSION_TTL   = 3600          # 1 hour for normal sessions
+REMEMBER_TTL  = 365 * 24 * 3600  # 1 year for "remember me" sessions (effectively permanent)
+STAKE         = float(os.environ.get("BOT_STAKE", "6.00"))
 
 SETTLED = {"win", "loss", "stop_loss"}
 
-sessions: dict = {}
+# ── Persistent session store ───────────────────────────────────────────────────
+# Sessions are written to disk so they survive restarts, crashes, and redeploys.
+# Format: { token: { "exp": float_timestamp_or_0, "remember": bool } }
+# exp=0 means the session never expires (remember me).
+
+def _load_sessions() -> dict:
+    try:
+        if SESSIONS_FILE.exists():
+            return json.loads(SESSIONS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def _save_sessions(s: dict):
+    try:
+        SESSIONS_FILE.write_text(json.dumps(s))
+    except Exception:
+        pass
+
+sessions: dict = _load_sessions()
 
 # ── Session helpers ────────────────────────────────────────────────────────────
-def _new_session():
+def _new_session(remember: bool = False) -> str:
+    """Create a new session token. remember=True means it never expires."""
     tok = secrets.token_hex(32)
-    sessions[tok] = time.time() + SESSION_TTL
+    exp = 0.0 if remember else time.time() + SESSION_TTL  # 0 = never expires
+    sessions[tok] = {"exp": exp, "remember": remember}
+    _save_sessions(sessions)
     return tok
 
-def _valid_session(tok):
-    if not tok: return False
-    exp = sessions.get(tok, 0)
-    if time.time() > exp:
-        sessions.pop(tok, None)
+def _valid_session(tok) -> bool:
+    if not tok:
         return False
-    sessions[tok] = time.time() + SESSION_TTL
+    entry = sessions.get(tok)
+    if not entry:
+        return False
+    exp = entry.get("exp", 0)
+    # exp=0 means remember-me — never expires
+    if exp != 0 and time.time() > exp:
+        sessions.pop(tok, None)
+        _save_sessions(sessions)
+        return False
+    # Slide expiry for regular sessions (keep-alive while actively using)
+    if exp != 0:
+        sessions[tok]["exp"] = time.time() + SESSION_TTL
+        _save_sessions(sessions)
     return True
+
+def _delete_session(tok):
+    sessions.pop(tok, None)
+    _save_sessions(sessions)
 
 def _get_cookie(headers, name):
     for part in headers.get("Cookie", "").split(";"):
         k, _, v = part.strip().partition("=")
-        if k.strip() == name: return v.strip()
+        if k.strip() == name:
+            return v.strip()
     return None
 
 def load_trades():
@@ -349,10 +387,15 @@ h1{{font-size:26px;font-weight:600;color:#f8fafc;margin-bottom:6px}}
 .sub{{font-size:13px;color:#64748b;margin-bottom:28px}}
 label{{display:block;font-family:'IBM Plex Mono',monospace;font-size:10px;
        letter-spacing:.2em;color:#64748b;text-transform:uppercase;margin-bottom:6px}}
-input{{width:100%;background:#0c0e14;border:1px solid #1e2535;border-radius:7px;
+input[type=text],input[type=password]{{width:100%;background:#0c0e14;border:1px solid #1e2535;border-radius:7px;
        padding:11px 14px;color:#e2e8f0;font-family:'IBM Plex Mono',monospace;
        font-size:13px;outline:none;transition:border-color .2s;margin-bottom:18px}}
-input:focus{{border-color:#3b82f6}}
+input[type=text]:focus,input[type=password]:focus{{border-color:#3b82f6}}
+.remember{{display:flex;align-items:center;gap:10px;margin-bottom:20px;cursor:pointer}}
+.remember input[type=checkbox]{{width:15px;height:15px;accent-color:#3b82f6;cursor:pointer;
+  margin:0;flex-shrink:0}}
+.remember-lbl{{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#64748b;
+  letter-spacing:.05em;user-select:none}}
 button{{width:100%;background:#3b82f6;color:#fff;border:none;border-radius:7px;
         padding:13px;font-family:'IBM Plex Mono',monospace;font-size:12px;
         font-weight:600;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;
@@ -372,6 +415,10 @@ button:hover{{background:#2563eb}}
     <input type="text" name="username" autocomplete="username" required autofocus>
     <label>Password</label>
     <input type="password" name="password" autocomplete="current-password" required>
+    <label class="remember">
+      <input type="checkbox" name="remember" value="1">
+      <span class="remember-lbl">Remember me — stay signed in until logout</span>
+    </label>
     <button type="submit">Sign In &rarr;</button>
   </form>
 </div></body></html>"""
@@ -836,9 +883,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/logout":
-            sessions.pop(self._tok(), None)
+            _delete_session(self._tok())
             self._send(302, "", hdrs={"Location": "/",
-                                      "Set-Cookie": "session=; Max-Age=0; Path=/"})
+                                      "Set-Cookie": "session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"})
             return
         if path in ("/", "/login"):
             if _valid_session(self._tok()):
@@ -862,17 +909,24 @@ class Handler(BaseHTTPRequestHandler):
         if urlparse(self.path).path != "/login":
             self._send(405, "Method Not Allowed")
             return
-        length = int(self.headers.get("Content-Length", 0))
-        p      = parse_qs(self.rfile.read(length).decode())
-        user   = p.get("username", [""])[0]
-        pw     = p.get("password",  [""])[0]
-        ok_u   = secrets.compare_digest(user.encode(), DASH_USER.encode())
-        ok_p   = secrets.compare_digest(pw.encode(),   DASH_PASS.encode())
+        length   = int(self.headers.get("Content-Length", 0))
+        p        = parse_qs(self.rfile.read(length).decode())
+        user     = p.get("username", [""])[0]
+        pw       = p.get("password",  [""])[0]
+        remember = bool(p.get("remember", [""])[0])   # checkbox sends "1" if checked
+        ok_u     = secrets.compare_digest(user.encode(), DASH_USER.encode())
+        ok_p     = secrets.compare_digest(pw.encode(),   DASH_PASS.encode())
         if ok_u and ok_p:
-            tok = _new_session()
+            tok = _new_session(remember=remember)
+            # remember=True  → Max-Age=1 year  → browser keeps cookie permanently
+            # remember=False → Max-Age=1 hour  → cookie gone when browser session ends
+            max_age  = REMEMBER_TTL if remember else SESSION_TTL
+            cookie   = (
+                f"session={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"
+            )
             self._send(302, "", hdrs={
                 "Location":   "/dashboard",
-                "Set-Cookie": f"session={tok}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL}",
+                "Set-Cookie": cookie,
             })
         else:
             self._send(200, _LOGIN.format(error='<div class="err">Invalid credentials.</div>'))
