@@ -1,11 +1,16 @@
 """
-Polymarket Bot Dashboard v5
+Polymarket Bot Dashboard v6
 Fixes:
   1. FALSE UPDATES FIXED — balance card only reads from settled outcomes
      (win / loss / stop_loss). 'open' and 'unmatched' records no longer
      cause the balance to flicker or show wrong numbers.
   2. Full UI redesign — terminal-trading aesthetic, equity curve chart,
      proper KPI hierarchy, countdown refresh, no meta-refresh flicker.
+
+v6 fixes:
+  3. load_trades() now handles NDJSON format (bot v7+) and legacy JSON array
+  4. isinstance(t, dict) guard on all trade list processing — prevents AttributeError crash
+  5. STAKE default corrected to $6.00 to match bot
 """
 
 import os, json, secrets, time
@@ -19,7 +24,7 @@ DASH_USER   = os.environ.get("DASH_USER", "admin")
 DASH_PASS   = os.environ.get("DASH_PASS", "changeme")
 PORT        = int(os.environ.get("DASH_PORT", "8080"))
 SESSION_TTL = 3600
-STAKE       = float(os.environ.get("BOT_STAKE", "5.00"))
+STAKE       = float(os.environ.get("BOT_STAKE", "6.00"))
 
 # Only these outcomes represent a settled position with a real balance change
 SETTLED = {"win", "loss", "stop_loss"}
@@ -48,10 +53,32 @@ def _get_cookie(headers, name):
     return None
 
 def load_trades():
-    if TRADES_FILE.exists():
-        try: return json.loads(TRADES_FILE.read_text())
-        except Exception: return []
-    return []
+    """Read trades.json — supports both NDJSON (new bot v7+) and legacy JSON array."""
+    if not TRADES_FILE.exists():
+        return []
+    try:
+        text = TRADES_FILE.read_text().strip()
+        if not text:
+            return []
+        # NDJSON format: each line is a separate JSON object (bot v7+)
+        if text.startswith("{"):
+            records = []
+            for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except Exception:
+                        pass  # skip malformed lines
+            return records
+        # Legacy format: single JSON array (bot v5/v6)
+        data = json.loads(text)
+        # Guard: must be a list of dicts
+        if isinstance(data, list):
+            return [r for r in data if isinstance(r, dict)]
+        return []
+    except Exception:
+        return []
 
 # ── Stats ──────────────────────────────────────────────────────────────────────
 def get_latest_balance(trades):
@@ -59,6 +86,7 @@ def get_latest_balance(trades):
     Walk trades in reverse. ONLY consider settled outcomes so the balance
     card never lies after an 'open' or 'unmatched' write.
     """
+    trades = [t for t in trades if isinstance(t, dict)]
     for t in reversed(trades):
         if t.get("outcome") not in SETTLED:
             continue
@@ -68,6 +96,8 @@ def get_latest_balance(trades):
     return None   # no settled trade yet
 
 def compute_stats(trades):
+    # Guard: skip any non-dict entries (e.g. from partially-written NDJSON lines)
+    trades = [t for t in trades if isinstance(t, dict)]
     done  = [t for t in trades if t.get("outcome") in SETTLED]
     wins  = [t for t in done if t["outcome"] == "win"]
     loses = [t for t in done if t["outcome"] == "loss"]
@@ -556,6 +586,7 @@ def build_page(trades):
     )
 
     # ── Table ───────────────────────────────────────────────────────────────
+    trades = [t for t in trades if isinstance(t, dict)]
     recent = list(reversed(trades[-100:]))
     if recent:
         rows = ""
