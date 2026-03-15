@@ -695,14 +695,20 @@ async def execute_sell(client: ClobClient, market: Market, position: Position,
             resp  = client.post_order(order, OrderType.FAK)
             log.info(f"  Sell resp (attempt {attempt}): {resp}")
 
-            # Primary confirmation: size_matched in response
-            size_matched = float(resp.get("size_matched", 0)) if resp else 0
-            if size_matched > 0:
-                log.info(f"  ✅ Sell filled: size_matched={size_matched} on attempt {attempt}")
+            # Primary confirmation: any of these fields indicate a fill.
+            # The SDK returns takingAmount/makingAmount (not size_matched) for FAK sells.
+            size_matched  = float(resp.get("size_matched",  0) or 0) if resp else 0
+            taking_amount = float(resp.get("takingAmount",  0) or 0) if resp else 0
+            making_amount = float(resp.get("makingAmount",  0) or 0) if resp else 0
+            status        = (resp.get("status", "") or "").lower()   if resp else ""
+
+            if size_matched > 0 or taking_amount > 0 or making_amount > 0 or status == "matched":
+                log.info(f"  ✅ Sell filled on attempt {attempt}: "
+                         f"status={status} taking={taking_amount} making={making_amount}")
                 return resp
 
-            # Secondary confirmation: balance increased
-            await asyncio.sleep(0.5)
+            # Fallback: balance increased (allow 2s for on-chain propagation)
+            await asyncio.sleep(2.0)
             bal_after = get_balance(client)
             if bal_after > bal_before + 0.01:
                 log.info(f"  ✅ Sell confirmed via balance: "
@@ -2079,8 +2085,10 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
     log.info(f"[REDEEM-LOOP] Started — scanning for orphan redeemable positions every {SCAN_INTERVAL}s")
 
     # CIDs where cascade was submitted but we haven't confirmed clearance yet.
-    # Maps cid -> timestamp of submission. After one full scan interval, if the
-    # position is still redeemable, we discard and retry.
+    # Maps cid -> {"submitted_at": float, "retries": int}
+    # A CID stays here until it disappears from the redeemable list (confirmed cleared)
+    # OR it exceeds MAX_RETRIES — at which point we give up to avoid infinite spam.
+    MAX_RETRIES = 10   # ~5 minutes at 30s interval before giving up
     pending_verification: dict = {}
 
     while not stop.is_set():
@@ -2106,17 +2114,28 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
             }
 
             # ── Verify previously submitted cascades ──────────────────────────
-            # If a CID we submitted last scan is STILL redeemable, the tx didn't
-            # land — discard from seen set so we retry this scan.
-            for cid, submitted_at in list(pending_verification.items()):
-                if cid in current_redeemable_cids:
-                    age = int(time.time() - submitted_at)
-                    log.warning(f"[REDEEM-LOOP] ⚠️ Cascade for {cid[:20]}... not confirmed after "
-                                f"{age}s — tx may have dropped, retrying")
-                    state.redeemed_condition_ids.discard(cid)
-                else:
+            # Only delete from pending_verification once a CID is confirmed cleared
+            # (no longer in the redeemable set) OR it has hit MAX_RETRIES.
+            for cid, info in list(pending_verification.items()):
+                if cid not in current_redeemable_cids:
+                    # Cleared on-chain — done
                     log.info(f"[REDEEM-LOOP] ✅ Confirmed cleared: {cid[:20]}...")
-                del pending_verification[cid]
+                    del pending_verification[cid]
+                else:
+                    retries = info["retries"]
+                    age = int(time.time() - info["submitted_at"])
+                    if retries >= MAX_RETRIES:
+                        log.warning(f"[REDEEM-LOOP] ⚠️ Giving up on {cid[:20]}... after "
+                                    f"{retries} retries ({age}s) — all layers consistently failing. "
+                                    f"Manual redemption may be needed on polymarket.com.")
+                        del pending_verification[cid]
+                        # Keep in redeemed_condition_ids to permanently stop retrying
+                    else:
+                        log.warning(f"[REDEEM-LOOP] ⚠️ Cascade for {cid[:20]}... not confirmed after "
+                                    f"{age}s (retry {retries+1}/{MAX_RETRIES}) — retrying")
+                        # Allow retry this scan by removing from seen set
+                        state.redeemed_condition_ids.discard(cid)
+                        del pending_verification[cid]
 
             redeemable = [
                 p for p in positions
@@ -2133,28 +2152,35 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
                 if not cid:
                     continue
 
+                prior_retries = pending_verification.get(cid, {}).get("retries", 0)
+
                 log.warning(f"[REDEEM-LOOP] ⚠️ Orphan redeemable: conditionId={cid[:20]}... "
                             f"size={size} — submitting cascade")
 
                 # Mark as seen BEFORE cascade so we don't retry on next scan
                 state.redeemed_condition_ids.add(cid)
 
+                submitted = False
                 l1_ok = await asyncio.to_thread(_redeem_via_relayer, cid)
                 if l1_ok:
                     log.info(f"[REDEEM-LOOP] ✅ L1 submitted for {cid[:20]}...")
-                    pending_verification[cid] = time.time()
-                    continue
+                    submitted = True
+                else:
+                    l2_ok = await asyncio.to_thread(_redeem_via_poly_web3, cid)
+                    if l2_ok:
+                        log.info(f"[REDEEM-LOOP] ✅ L2 submitted for {cid[:20]}...")
+                        submitted = True
+                    else:
+                        l3_ok = await asyncio.to_thread(_redeem_via_proxy_forward, cid)
+                        if l3_ok:
+                            log.info(f"[REDEEM-LOOP] ✅ L3 submitted for {cid[:20]}...")
+                            submitted = True
 
-                l2_ok = await asyncio.to_thread(_redeem_via_poly_web3, cid)
-                if l2_ok:
-                    log.info(f"[REDEEM-LOOP] ✅ L2 submitted for {cid[:20]}...")
-                    pending_verification[cid] = time.time()
-                    continue
-
-                l3_ok = await asyncio.to_thread(_redeem_via_proxy_forward, cid)
-                if l3_ok:
-                    log.info(f"[REDEEM-LOOP] ✅ L3 submitted for {cid[:20]}...")
-                    pending_verification[cid] = time.time()
+                if submitted:
+                    pending_verification[cid] = {
+                        "submitted_at": time.time(),
+                        "retries": prior_retries + 1,
+                    }
                 else:
                     log.warning(f"[REDEEM-LOOP] ⚠️ All layers failed for {cid[:20]}... "
                                 f"— will retry next scan")
