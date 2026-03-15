@@ -107,7 +107,7 @@ ADAPTIVE_THRESH   = 0.98    # Raised after 2 consecutive losses
 ENTRY_WINDOW_SEC  = 30      # Enter any time price >= threshold AND <=30s remain
 PRESIGN_BEFORE    = 40      # Build signed order at T-40s (removes signing latency)
 MIN_FIRE_BUFFER   = 5       # Never fire if < 5s remain (too risky)
-STOP_LOSS_BID     = 0.75    # Exit position if best_bid falls below this
+STOP_LOSS_BID     = 0.80    # Exit position if best_bid falls below this
 STOP_LOSS_MIN_SEC = 5       # Don't stop-loss if < 5s remain (just let it resolve)
 STABILITY_N       = 5       # Price ticks needed for stability check
 MAX_STD_DEV       = 0.015   # Max std-dev for stability
@@ -1093,9 +1093,8 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
 async def _do_buy(client, session, state: BotState, side, token_id, price, bal_before, time_left=30):
     """
     Retry buy until filled, time runs out, or we hit MIN_FIRE_BUFFER.
-    - Attempt 1: immediately
-    - Attempts 2+: wait 1s between tries (safe rate: ~1 req/s, Polymarket limit is 10/s)
-    - Re-signs fresh order each attempt so signature is always valid
+    - Attempt 1: uses presigned_order if available (saves ~20-50ms signing latency)
+    - Attempts 2+: re-signs fresh order each time (signature may have expired)
     - Stops if time_left drops to MIN_FIRE_BUFFER or position filled
     """
     attempt = 0
@@ -1109,14 +1108,18 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
             log.info(f"  Buy abort: only {now_left}s left, too close to close.")
             break
 
-        # Re-sign fresh order each attempt (GTC orders need fresh signature)
-        order = presign_order(client, state.market, token_id, price)
-        if not order:
-            log.warning(f"  Attempt {attempt}: presign failed, retrying in 1s...")
-            await asyncio.sleep(1)
-            continue
-
-        log.info(f"  Buy attempt {attempt} @ T-{now_left}s price={price:.4f}")
+        # Attempt 1: use presigned order if it was built for this token at this price
+        if attempt == 1 and state.presigned_order and state.presigned_for == token_id:
+            order = state.presigned_order
+            log.info(f"  Buy attempt 1 (presigned) @ T-{now_left}s price={price:.4f}")
+        else:
+            # Re-sign fresh order for all retries
+            order = presign_order(client, state.market, token_id, price)
+            if not order:
+                log.warning(f"  Attempt {attempt}: presign failed, retrying in 1s...")
+                await asyncio.sleep(1)
+                continue
+            log.info(f"  Buy attempt {attempt} (fresh sign) @ T-{now_left}s price={price:.4f}")
         try:
             resp = client.post_order(order, OrderType.GTC)
             size_matched = float(resp.get("size_matched", 0)) if resp else 0
@@ -1781,118 +1784,91 @@ async def _background_redeem(
     """
     Background task: waits for on-chain settlement then redeems via 3-layer cascade.
 
-    Timeline after a 5-min BTC market resolves:
-      ~0-30s   : WSS market_resolved fires, oracle tx submitted on-chain
-      ~2-3 min : oracle tx confirmed; Data API shows redeemable=true
-      ~3-5 min : redeem tx processes, USDC arrives in proxy wallet
-      ~10 min  : hard timeout — give up and warn
-
-    Three-Layer Redeem Cascade (all correctly routed through the proxy contract):
-      Layer 1: py_builder_relayer_client with RelayerTxType.PROXY  (gasless)
-      Layer 2: poly-web3 library                                    (gasless)
-      Layer 3: Direct proxy.forward() via web3.py                   (~$0.001 MATIC gas)
-
-    Each layer is tried once when redeemable=True is first confirmed.
-    Balance is polled every 5s after submission until USDC arrives.
+    IMPORTANT: This runs fire-and-forget while the trading loop advances to the next
+    market. It must NOT use state.last_balance as a baseline — the trading loop will
+    overwrite it with the next trade's balance. Instead we use an isolated snapshot
+    taken at task start, and only push back to state.last_balance on confirmed claim.
     """
-    POLL_INTERVAL = 5    # seconds between redeemable checks
-    HARD_TIMEOUT  = 600  # 10-minute hard deadline
+    POLL_INTERVAL       = 8     # seconds between redeemable checks
+    HARD_TIMEOUT        = 600   # 10-minute hard deadline
+    CASCADE_RETRY_AFTER = 60    # retry cascade if balance hasn't changed after this many seconds
 
-    log.info(f"[REDEEM] Background task started for {condition_id[:20]}... — polling every {POLL_INTERVAL}s")
-    deadline          = time.time() + HARD_TIMEOUT
-    bal_before_redeem = get_balance(client)
-    attempt           = 0
-    redeem_submitted  = False  # ensure we only run the cascade once
+    log.info(f"[REDEEM] Background task started for {condition_id[:20]}... "
+             f"— polling every {POLL_INTERVAL}s, hard timeout {HARD_TIMEOUT}s")
+
+    deadline           = time.time() + HARD_TIMEOUT
+    # Take our OWN balance snapshot — do not touch state.last_balance until confirmed
+    bal_snapshot       = get_balance(client)
+    last_cascade_ts    = 0.0
+    attempt            = 0
 
     while time.time() < deadline:
         attempt += 1
         elapsed = int(time.time() - deadline + HARD_TIMEOUT)
-        log.info(f"[REDEEM] Attempt {attempt} (T+{elapsed}s elapsed)...")
 
-        # Fast-path: check if balance already increased (auto-settlement by Polymarket)
-        await asyncio.sleep(2)
+        await asyncio.sleep(POLL_INTERVAL)
+
+        # ── Check if USDC arrived ─────────────────────────────────────────────
         bal_now = get_balance(client)
-        state.last_balance = bal_now
-        gained = bal_now - bal_before_redeem
-        log.info(f"[REDEEM] Balance: ${bal_before_redeem:.4f} → ${bal_now:.4f} (gained ${gained:+.4f})")
+        gained  = bal_now - bal_snapshot
+        log.info(f"[REDEEM] Poll {attempt} (T+{elapsed}s) | "
+                 f"bal=${bal_now:.4f} gained=${gained:+.4f}")
 
         if gained > 0.01:
-            log.info(f"[REDEEM] ✅ CLAIMED (auto-settled)! New balance: ${bal_now:.4f}")
+            log.info(f"[REDEEM] ✅ CLAIMED! ${bal_snapshot:.4f} → ${bal_now:.4f} (+${gained:.4f})")
+            # NOW update state — this is the only safe place to do it
+            state.last_balance = bal_now
             _save_resolved_trade(pos, "win", gained, gross, fee_usdc, net, bal_before, bal_now)
             return
 
-        # Check if the Data API confirms the position is redeemable
+        # ── Check redeemable status ───────────────────────────────────────────
         is_redeemable = await _auto_redeem(session, condition_id)
 
-        if is_redeemable and not redeem_submitted:
-            log.info("[REDEEM] Position confirmed redeemable — launching 3-layer cascade...")
-            redeem_submitted = True  # only attempt cascade once
+        if not is_redeemable:
+            log.info(f"[REDEEM] Not yet redeemable — next check in {POLL_INTERVAL}s...")
+            continue
 
-            # ── Layer 1: Official relayer SDK with PROXY type ─────────────────
-            log.info("[REDEEM] Layer 1: py_builder_relayer_client (RelayerTxType.PROXY)...")
-            l1_ok = _redeem_via_relayer(condition_id)
+        # ── Run cascade if not recently attempted ─────────────────────────────
+        time_since_last_cascade = time.time() - last_cascade_ts
+        if last_cascade_ts == 0.0 or time_since_last_cascade >= CASCADE_RETRY_AFTER:
+            log.info(f"[REDEEM] Redeemable confirmed — launching 3-layer cascade "
+                     f"(last attempt {int(time_since_last_cascade)}s ago)...")
+            last_cascade_ts = time.time()
+
+            l1_ok = await asyncio.to_thread(_redeem_via_relayer, condition_id)
             if l1_ok:
-                log.info("[REDEEM] Layer 1 submitted ✅ — waiting for USDC...")
+                log.info("[REDEEM] Layer 1 submitted ✅")
             else:
-                log.info("[REDEEM] Layer 1 failed or skipped — trying Layer 2...")
-
-                # ── Layer 2: poly-web3 library ────────────────────────────────
-                log.info("[REDEEM] Layer 2: poly-web3 library...")
-                l2_ok = _redeem_via_poly_web3(condition_id)
+                log.info("[REDEEM] Layer 1 failed — trying Layer 2...")
+                l2_ok = await asyncio.to_thread(_redeem_via_poly_web3, condition_id)
                 if l2_ok:
-                    log.info("[REDEEM] Layer 2 submitted ✅ — waiting for USDC...")
+                    log.info("[REDEEM] Layer 2 submitted ✅")
                 else:
-                    log.info("[REDEEM] Layer 2 failed or skipped — trying Layer 3...")
-
-                    # ── Layer 3: Direct proxy.forward() via web3.py ───────────
-                    log.info("[REDEEM] Layer 3: direct proxy.forward() via web3.py...")
-                    l3_ok = _redeem_via_proxy_forward(condition_id)
+                    log.info("[REDEEM] Layer 2 failed — trying Layer 3...")
+                    l3_ok = await asyncio.to_thread(_redeem_via_proxy_forward, condition_id)
                     if l3_ok:
-                        log.info("[REDEEM] Layer 3 submitted ✅ — waiting for USDC...")
+                        log.info("[REDEEM] Layer 3 submitted ✅")
                     else:
                         log.warning(
-                            "[REDEEM] All 3 layers failed.\n"
-                            "         Possible causes:\n"
-                            "           • No Builder creds (layers 1+2) AND no MATIC (layer 3)\n"
-                            "           • Proxy not deployed (log in to polymarket.com first)\n"
-                            "         Balance polling continues — Polymarket may auto-settle."
+                            "[REDEEM] ⚠️ All 3 layers failed — will retry in 60s.\n"
+                            "         Causes: no Builder creds (L1+L2), no MATIC (L3)."
                         )
+                        last_cascade_ts = time.time() - CASCADE_RETRY_AFTER + 15
+        else:
+            log.info(f"[REDEEM] Cascade attempted {int(time_since_last_cascade)}s ago — "
+                     f"waiting for USDC (retry cascade in "
+                     f"{int(CASCADE_RETRY_AFTER - time_since_last_cascade)}s)...")
 
-        if is_redeemable:
-            # Poll balance every 5s for up to 2 more minutes after submission
-            for wait_idx in range(24):
-                await asyncio.sleep(5)
-                bal_now = get_balance(client)
-                state.last_balance = bal_now
-                gained = bal_now - bal_before_redeem
-                log.info(
-                    f"[REDEEM] Waiting for USDC: bal=${bal_now:.4f} "
-                    f"gained=${gained:+.4f} ({wait_idx+1}/24)"
-                )
-                if gained > 0.01:
-                    log.info(f"[REDEEM] ✅ CLAIMED! New balance: ${bal_now:.4f}")
-                    _save_resolved_trade(pos, "win", gained, gross, fee_usdc, net, bal_before, bal_now)
-                    return
-            # Still not arrived after 2 minutes of polling — log and give up
-            log.warning(
-                "[REDEEM] redeemable=True and redeem submitted, but balance hasn't changed.\n"
-                "         This can happen if the tx is still pending on Polygon.\n"
-                "         Check polygonscan.com for your proxy address or claim manually at polymarket.com"
-            )
-            _save_resolved_trade(pos, "win", 0, gross, fee_usdc, net, bal_before, bal_now)
-            return
-
-        log.info(f"[REDEEM] Not yet redeemable — next check in {POLL_INTERVAL}s...")
-        await asyncio.sleep(POLL_INTERVAL)
-
-    # Hard timeout reached
-    bal_final = get_balance(client)
+    # Hard timeout
+    bal_final    = get_balance(client)
+    gained_final = bal_final - bal_snapshot
     state.last_balance = bal_final
     log.warning(
-        f"[REDEEM] ⚠️ 10-min timeout. Final balance: ${bal_final:.4f}.\n"
-        f"         Claim manually at polymarket.com if prize not received."
+        f"[REDEEM] ⚠️ 10-min timeout. bal=${bal_final:.4f} gained=${gained_final:+.4f}\n"
+        f"         Claim manually at polymarket.com if prize missing.\n"
+        f"         Condition ID: {condition_id}"
     )
-    _save_resolved_trade(pos, "win", bal_final - bal_before, gross, fee_usdc, net, bal_before, bal_final)
+    _save_resolved_trade(pos, "win", gained_final, gross, fee_usdc, net, bal_before, bal_final)
 
 
 def _save_resolved_trade(pos, outcome, payout, gross, fee_usdc, net, bal_before, bal_after):
