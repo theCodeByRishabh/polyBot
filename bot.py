@@ -1852,6 +1852,9 @@ async def _background_redeem(
     log.info(f"[REDEEM] Background task started for {condition_id[:20]}... "
              f"— polling every {POLL_INTERVAL}s, hard timeout {HARD_TIMEOUT}s")
 
+    # Register immediately so redeem_loop never fires a second cascade for this CID
+    state.redeemed_condition_ids.add(condition_id)
+
     deadline           = time.time() + HARD_TIMEOUT
     # Take our OWN balance snapshot — do not touch state.last_balance until confirmed
     bal_snapshot       = get_balance(client)
@@ -1919,11 +1922,18 @@ async def _background_redeem(
     bal_final    = get_balance(client)
     gained_final = bal_final - bal_snapshot
     state.last_balance = bal_final
-    log.warning(
-        f"[REDEEM] ⚠️ 10-min timeout. bal=${bal_final:.4f} gained=${gained_final:+.4f}\n"
-        f"         Claim manually at polymarket.com if prize missing.\n"
-        f"         Condition ID: {condition_id}"
-    )
+    if gained_final <= 0.01:
+        # Cascade never succeeded — remove from seen set so redeem_loop can retry
+        state.redeemed_condition_ids.discard(condition_id)
+        log.warning(
+            f"[REDEEM] ⚠️ 10-min timeout, no USDC received. Handing off to redeem_loop for retry.\n"
+            f"         Condition ID: {condition_id}"
+        )
+    else:
+        log.warning(
+            f"[REDEEM] ⚠️ 10-min timeout but USDC arrived: gained=${gained_final:.4f}.\n"
+            f"         Condition ID: {condition_id}"
+        )
     _save_resolved_trade(pos, "win", gained_final, gross, fee_usdc, net, bal_before, bal_final)
 
 
@@ -2068,6 +2078,11 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
 
     log.info(f"[REDEEM-LOOP] Started — scanning for orphan redeemable positions every {SCAN_INTERVAL}s")
 
+    # CIDs where cascade was submitted but we haven't confirmed clearance yet.
+    # Maps cid -> timestamp of submission. After one full scan interval, if the
+    # position is still redeemable, we discard and retry.
+    pending_verification: dict = {}
+
     while not stop.is_set():
         await asyncio.sleep(SCAN_INTERVAL)
         if stop.is_set():
@@ -2084,6 +2099,25 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
             if not isinstance(positions, list):
                 continue
 
+            current_redeemable_cids = {
+                p.get("conditionId", "")
+                for p in positions
+                if p.get("redeemable") is True and p.get("conditionId", "")
+            }
+
+            # ── Verify previously submitted cascades ──────────────────────────
+            # If a CID we submitted last scan is STILL redeemable, the tx didn't
+            # land — discard from seen set so we retry this scan.
+            for cid, submitted_at in list(pending_verification.items()):
+                if cid in current_redeemable_cids:
+                    age = int(time.time() - submitted_at)
+                    log.warning(f"[REDEEM-LOOP] ⚠️ Cascade for {cid[:20]}... not confirmed after "
+                                f"{age}s — tx may have dropped, retrying")
+                    state.redeemed_condition_ids.discard(cid)
+                else:
+                    log.info(f"[REDEEM-LOOP] ✅ Confirmed cleared: {cid[:20]}...")
+                del pending_verification[cid]
+
             redeemable = [
                 p for p in positions
                 if p.get("redeemable") is True
@@ -2093,44 +2127,38 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
             if not redeemable:
                 continue  # nothing to do — no log spam
 
-            # Skip any CID that belongs to the current live position
-            # (_background_redeem already owns it)
-            active_cid = (
-                state.position.market.condition_id
-                if state.position and state.position.market
-                else ""
-            )
-
             for p in redeemable:
                 cid  = p.get("conditionId", "")
                 size = p.get("size", "?")
-                if not cid or cid == active_cid:
+                if not cid:
                     continue
 
                 log.warning(f"[REDEEM-LOOP] ⚠️ Orphan redeemable: conditionId={cid[:20]}... "
                             f"size={size} — submitting cascade")
 
                 # Mark as seen BEFORE cascade so we don't retry on next scan
-                # even if cascade fails (avoids hammering a broken condition)
                 state.redeemed_condition_ids.add(cid)
 
                 l1_ok = await asyncio.to_thread(_redeem_via_relayer, cid)
                 if l1_ok:
                     log.info(f"[REDEEM-LOOP] ✅ L1 submitted for {cid[:20]}...")
+                    pending_verification[cid] = time.time()
                     continue
 
                 l2_ok = await asyncio.to_thread(_redeem_via_poly_web3, cid)
                 if l2_ok:
                     log.info(f"[REDEEM-LOOP] ✅ L2 submitted for {cid[:20]}...")
+                    pending_verification[cid] = time.time()
                     continue
 
                 l3_ok = await asyncio.to_thread(_redeem_via_proxy_forward, cid)
                 if l3_ok:
                     log.info(f"[REDEEM-LOOP] ✅ L3 submitted for {cid[:20]}...")
+                    pending_verification[cid] = time.time()
                 else:
                     log.warning(f"[REDEEM-LOOP] ⚠️ All layers failed for {cid[:20]}... "
-                                f"— claim manually at polymarket.com")
-                    # Remove from seen set so next scan retries it
+                                f"— will retry next scan")
+                    # Remove from seen set so next scan retries
                     state.redeemed_condition_ids.discard(cid)
 
         except Exception as e:
