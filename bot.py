@@ -133,6 +133,13 @@ OSCILLATION_N           = 6      # how many recent ticks to inspect
 OSCILLATION_MAX_REVERSE = 0.08   # a single reverse tick > 8¢ counts as a bad swing
 OSCILLATION_BAD_SWINGS  = 2      # skip if >= this many BAD reverse ticks found
 
+# ── Late-entry tightening ──────────────────────────────────────────────────────
+# Within LATE_ENTRY_MAX_T seconds of close the market has less time to recover
+# from a sudden flip, so we demand a higher ask before entering.
+# Effective threshold = base/adaptive threshold + LATE_ENTRY_SURCHARGE.
+LATE_ENTRY_MAX_T     = 20    # seconds from close where tightening kicks in
+LATE_ENTRY_SURCHARGE = 0.02  # add 2¢ to required ask when time_left < LATE_ENTRY_MAX_T
+
 TRADES_FILE = Path("trades.json")
 
 # ─── Data structures ──────────────────────────────────────────────────────────
@@ -527,6 +534,14 @@ def get_signal(market: Market, history: deque, consecutive_losses: int,
     if consecutive_losses >= 2:
         log.info(f"  Adaptive threshold: {threshold*100:.0f}% (streak of {consecutive_losses} losses)")
 
+    # Late-entry tightening: raise required ask by LATE_ENTRY_SURCHARGE when close
+    # to expiry. Presigned orders at T-40s are unaffected (time_left defaults to 999).
+    late_entry = time_left < LATE_ENTRY_MAX_T
+    effective_threshold = min(threshold + LATE_ENTRY_SURCHARGE, 1.00) if late_entry else threshold
+    if late_entry:
+        log.info(f"  Late-entry tightening: T-{time_left}s < {LATE_ENTRY_MAX_T}s — "
+                 f"threshold raised {threshold:.2f} -> {effective_threshold:.2f}")
+
     for token_id, side_label in [
         (market.up_token_id,   "up"),
         (market.down_token_id, "down"),
@@ -537,7 +552,7 @@ def get_signal(market: Market, history: deque, consecutive_losses: int,
         ticks = asks[-STABILITY_N:]
         if len(ticks) < STABILITY_N:
             continue
-        if ticks[-1] < threshold:
+        if ticks[-1] < effective_threshold:
             continue
         std = statistics.stdev(ticks) if len(ticks) > 1 else 0.0
         if std > MAX_STD_DEV:
@@ -1363,7 +1378,6 @@ def _redeem_via_relayer(condition_id: str) -> bool:
             PROXY = "PROXY"
             SAFE  = "SAFE"
         RelayerTxType = _ShimTxType
-        log.info("[REDEEM L1] RelayerTxType not in SDK models — using string shim")
 
     # ── Resolve Transaction class (name also varies) ───────────────────────────
     TransactionCls = getattr(br_models, "Transaction", None)
@@ -1394,7 +1408,6 @@ def _redeem_via_relayer(condition_id: str) -> bool:
         try:
             rc_sig    = inspect.signature(RelayClient.__init__)
             rc_params = [p for p in rc_sig.parameters if p != "self"]
-            log.info(f"[REDEEM L1] RelayClient params: {rc_params}")
         except Exception:
             rc_params = []
 
@@ -1423,7 +1436,6 @@ def _redeem_via_relayer(condition_id: str) -> bool:
                     rc_kwargs[p] = param_map[p]
             try:
                 relay_client = RelayClient(**rc_kwargs)
-                log.info(f"[REDEEM L1] RelayClient created via introspection: {list(rc_kwargs.keys())}")
             except Exception as e:
                 log.warning(f"[REDEEM L1] Introspected constructor failed: {e}")
 
@@ -1442,7 +1454,6 @@ def _redeem_via_relayer(condition_id: str) -> bool:
             for _a, _k in _attempts:
                 try:
                     relay_client = RelayClient(*_a, **_k)
-                    log.info(f"[REDEEM L1] RelayClient created (fallback args={len(_a)})")
                     break
                 except (TypeError, Exception) as _e:
                     _errs.append(str(_e))
@@ -1459,27 +1470,22 @@ def _redeem_via_relayer(condition_id: str) -> bool:
             if _fn:
                 try:
                     _fn(proxy_tx_type)
-                    log.info(f"[REDEEM L1] Set PROXY type via {_setter}()")
                 except Exception:
                     pass
                 break
 
         # ── Submit the redeem transaction ─────────────────────────────────────
         tx = TransactionCls(to=CTF_CONTRACT, data=calldata, value="0")
-        log.info("[REDEEM L1] Submitting via relayer (PROXY type)...")
         resp = relay_client.execute([tx], "Redeem CTF positions")
-        log.info(f"[REDEEM L1] Relayer response: {resp}")
-
         try:
             result = resp.wait()
-            log.info(f"[REDEEM L1] ✅ Confirmed: {result}")
-        except Exception as e:
-            log.info(f"[REDEEM L1] wait() skipped: {e}")
-
+            log.info(f"[REDEEM L1] ✅ Submitted: {result}")
+        except Exception:
+            pass
         return True
 
     except Exception as e:
-        log.warning(f"[REDEEM L1] Relayer attempt failed: {e}")
+        log.debug(f"[REDEEM L1] failed (expected for proxy wallets): {e}")
         return False
 
 # ─── LAYER 2: poly-web3 library (community Python relayer port) ───────────────
@@ -1539,7 +1545,6 @@ def _redeem_via_poly_web3(condition_id: str) -> bool:
         try:
             sig = inspect.signature(PolyWeb3Service.__init__)
             params = set(sig.parameters.keys()) - {"self"}
-            log.info(f"[REDEEM L2] PolyWeb3Service accepts: {params}")
         except Exception:
             params = set()
 
@@ -1576,21 +1581,21 @@ def _redeem_via_poly_web3(condition_id: str) -> bool:
             return False
 
         cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
-        log.info(f"[REDEEM L2] poly-web3 redeem for condition {cid[:20]}...")
 
         # Try known method names for redemption
-        result = None
         for method_name in ("redeem_positions", "redeem", "claim", "settle"):
             method = getattr(service, method_name, None)
             if method:
                 result = method(cid)
-                log.info(f"[REDEEM L2] ✅ {method_name}() result: {result}")
+                # Only log if we got a real tx receipt (non-empty list/dict with tx data)
+                if result and isinstance(result, (list, dict)) and result != []:
+                    log.info(f"[REDEEM L2] ✅ Redeemed {cid[:20]}... tx={result}")
                 return True
 
         log.warning("[REDEEM L2] No redeem method found on PolyWeb3Service")
         return False
     except Exception as e:
-        log.warning(f"[REDEEM L2] poly-web3 attempt failed: {e}")
+        log.warning(f"[REDEEM L2] failed: {e}")
         return False
 
 # ─── LAYER 3: Direct proxy.forward() via web3.py ──────────────────────────────
@@ -2131,8 +2136,7 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
                         del pending_verification[cid]
                         # Keep in redeemed_condition_ids to permanently stop retrying
                     else:
-                        log.warning(f"[REDEEM-LOOP] ⚠️ Cascade for {cid[:20]}... not confirmed after "
-                                    f"{age}s (retry {retries+1}/{MAX_RETRIES}) — retrying")
+                        log.debug(f"[REDEEM-LOOP] {cid[:20]}... pending ({age}s, retry {retries+1}/{MAX_RETRIES})")
                         # Allow retry this scan by removing from seen set
                         state.redeemed_condition_ids.discard(cid)
                         del pending_verification[cid]
@@ -2154,8 +2158,7 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
 
                 prior_retries = pending_verification.get(cid, {}).get("retries", 0)
 
-                log.warning(f"[REDEEM-LOOP] ⚠️ Orphan redeemable: conditionId={cid[:20]}... "
-                            f"size={size} — submitting cascade")
+                log.debug(f"[REDEEM-LOOP] processing orphan {cid[:20]}... size={size}")
 
                 # Mark as seen BEFORE cascade so we don't retry on next scan
                 state.redeemed_condition_ids.add(cid)
@@ -2163,17 +2166,14 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
                 submitted = False
                 l1_ok = await asyncio.to_thread(_redeem_via_relayer, cid)
                 if l1_ok:
-                    log.info(f"[REDEEM-LOOP] ✅ L1 submitted for {cid[:20]}...")
                     submitted = True
                 else:
                     l2_ok = await asyncio.to_thread(_redeem_via_poly_web3, cid)
                     if l2_ok:
-                        log.info(f"[REDEEM-LOOP] ✅ L2 submitted for {cid[:20]}...")
                         submitted = True
                     else:
                         l3_ok = await asyncio.to_thread(_redeem_via_proxy_forward, cid)
                         if l3_ok:
-                            log.info(f"[REDEEM-LOOP] ✅ L3 submitted for {cid[:20]}...")
                             submitted = True
 
                 if submitted:
@@ -2182,8 +2182,7 @@ async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
                         "retries": prior_retries + 1,
                     }
                 else:
-                    log.warning(f"[REDEEM-LOOP] ⚠️ All layers failed for {cid[:20]}... "
-                                f"— will retry next scan")
+                    log.warning(f"[REDEEM-LOOP] ⚠️ All layers failed for {cid[:20]}... — will retry next scan")
                     # Remove from seen set so next scan retries
                     state.redeemed_condition_ids.discard(cid)
 
