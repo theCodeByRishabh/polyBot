@@ -1210,18 +1210,38 @@ def _redeem_via_relayer(condition_id: str) -> bool:
         # ── ALWAYS use PROXY type for signature_type=1 (Magic/email) accounts ──
         proxy_tx_type = RelayerTxType.PROXY
 
-        # Build RelayClient — try keyword arg first (newer SDK), then positional
-        try:
-            relay_client = RelayClient(
-                RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config,
-                relay_tx_type=proxy_tx_type,
-                rpc_url=rpc_url,
-            )
-        except TypeError:
-            # Older SDK: positional args only
-            relay_client = RelayClient(
-                RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config, proxy_tx_type
-            )
+        # Build RelayClient — try every known SDK arg signature
+        relay_client = None
+        _rc_attempts = [
+            # newest SDK: all kwargs
+            (( RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config),
+             dict(relay_tx_type=proxy_tx_type, rpc_url=rpc_url)),
+            # newer SDK: no rpc_url
+            ((RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config),
+             dict(relay_tx_type=proxy_tx_type)),
+            # older SDK: 5 positional args
+            ((RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config, proxy_tx_type),
+             {}),
+            # minimal SDK: 3-arg version
+            ((RELAYER_URL, PRIVATE_KEY, builder_config),
+             {}),
+            # minimal SDK: 4-arg version with tx type
+            ((RELAYER_URL, PRIVATE_KEY, builder_config, proxy_tx_type),
+             {}),
+        ]
+        _rc_errors = []
+        for _args, _kwargs in _rc_attempts:
+            try:
+                relay_client = RelayClient(*_args, **_kwargs)
+                log.info(f"[REDEEM L1] RelayClient created (args={len(_args)}, kwargs={list(_kwargs.keys())})")
+                break
+            except TypeError as _te:
+                _rc_errors.append(str(_te))
+        if relay_client is None:
+            log.warning("[REDEEM L1] Could not instantiate RelayClient — tried all known signatures:")
+            for _e in _rc_errors:
+                log.warning(f"[REDEEM L1]   → {_e}")
+            return False
 
         tx = TransactionCls(to=CTF_CONTRACT, data=calldata, value="0")
         log.info(f"[REDEEM L1] Submitting via relayer (PROXY type)...")
@@ -1270,32 +1290,84 @@ def _redeem_via_poly_web3(condition_id: str) -> bool:
 
     key, secret, passphrase = creds
     try:
+        import inspect
+
+        relay_url = os.environ.get("POLYMARKET_RELAYER_URL", PW3_RELAYER_URL)
+
+        builder_config = PW3BuilderConfig(
+            local_builder_creds=PW3Creds(key=key, secret=secret, passphrase=passphrase)
+        )
+
+        # Build relayer client — try all known arg signatures
+        relayer_client = None
+        for _rc_args, _rc_kwargs in [
+            ((relay_url, CHAIN_ID, PRIVATE_KEY, builder_config), {}),
+            ((relay_url, PRIVATE_KEY, builder_config), {}),
+            ((relay_url, CHAIN_ID, PRIVATE_KEY), {}),
+        ]:
+            try:
+                relayer_client = PW3RelayClient(*_rc_args, **_rc_kwargs)
+                break
+            except TypeError:
+                pass
+        if relayer_client is None:
+            log.warning("[REDEEM L2] Could not create poly-web3 RelayClient")
+            return False
+
+        # Introspect PolyWeb3Service constructor to discover accepted params
+        try:
+            sig = inspect.signature(PolyWeb3Service.__init__)
+            params = set(sig.parameters.keys()) - {"self"}
+            log.info(f"[REDEEM L2] PolyWeb3Service accepts: {params}")
+        except Exception:
+            params = set()
+
+        # Build kwargs based on what the service actually accepts
         clob = ClobClient(
             CLOB_HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
             signature_type=1, funder=FUNDER_ADDRESS,
         )
         clob.set_api_creds(clob.create_or_derive_api_creds())
 
-        builder_config = PW3BuilderConfig(
-            local_builder_creds=PW3Creds(key=key, secret=secret, passphrase=passphrase)
-        )
-        relay_url = os.environ.get("POLYMARKET_RELAYER_URL", PW3_RELAYER_URL)
-        relayer_client = PW3RelayClient(
-            relay_url, CHAIN_ID, PRIVATE_KEY, builder_config
-        )
+        svc_kwargs = {}
+        if "clob_client" in params:      svc_kwargs["clob_client"]      = clob
+        if "relayer_client" in params:   svc_kwargs["relayer_client"]   = relayer_client
+        if "private_key" in params:      svc_kwargs["private_key"]      = PRIVATE_KEY
+        if "chain_id" in params:         svc_kwargs["chain_id"]         = CHAIN_ID
+        if "key" in params:              svc_kwargs["key"]              = PRIVATE_KEY
+        if "funder" in params:           svc_kwargs["funder"]           = FUNDER_ADDRESS
 
-        service = PolyWeb3Service(
-            clob_client=clob,
-            relayer_client=relayer_client,
-            private_key=PRIVATE_KEY,
-            chain_id=CHAIN_ID,
-        )
+        # Fallback: try positional construction
+        service = None
+        for _svc_try in [
+            lambda: PolyWeb3Service(**svc_kwargs),
+            lambda: PolyWeb3Service(clob, relayer_client),
+            lambda: PolyWeb3Service(PRIVATE_KEY, relayer_client),
+            lambda: PolyWeb3Service(relayer_client),
+        ]:
+            try:
+                service = _svc_try()
+                break
+            except TypeError:
+                pass
+        if service is None:
+            log.warning("[REDEEM L2] Could not instantiate PolyWeb3Service — unknown constructor signature")
+            return False
 
         cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
         log.info(f"[REDEEM L2] poly-web3 redeem for condition {cid[:20]}...")
-        result = service.redeem_positions(cid)
-        log.info(f"[REDEEM L2] ✅ poly-web3 result: {result}")
-        return True
+
+        # Try known method names for redemption
+        result = None
+        for method_name in ("redeem_positions", "redeem", "claim", "settle"):
+            method = getattr(service, method_name, None)
+            if method:
+                result = method(cid)
+                log.info(f"[REDEEM L2] ✅ {method_name}() result: {result}")
+                return True
+
+        log.warning("[REDEEM L2] No redeem method found on PolyWeb3Service")
+        return False
     except Exception as e:
         log.warning(f"[REDEEM L2] poly-web3 attempt failed: {e}")
         return False
@@ -1376,35 +1448,14 @@ def _redeem_via_proxy_forward(condition_id: str) -> bool:
             )
             # Still attempt — might just barely work
 
-        # Derive the proxy wallet address for this EOA using CREATE2
-        # Polymarket Proxy Factory: salt = keccak256(abi.encodePacked(eoa_address))
-        # The proxy is deterministic — we can compute it without an RPC call
-        from eth_utils import keccak
-        from eth_abi import encode as abi_encode
-
-        # Proxy init code hash (Polymarket EIP-1167 minimal proxy)
-        # This is the keccak256 of the proxy bytecode deployed by the factory
-        PROXY_INIT_CODE_HASH = "0x56d8f0ae0900b0dd1ee7fe64dfec9abaf5ab540aa012f9d98a3bf5a60a4d0aa1"
-
-        salt = keccak(
-            encode(["address"], [to_checksum_address(eoa_address)])
-        )
-        # CREATE2 address = keccak256(0xff ++ factory ++ salt ++ initCodeHash)[12:]
-        factory_bytes = bytes.fromhex(PROXY_FACTORY[2:])
-        init_hash     = bytes.fromhex(PROXY_INIT_CODE_HASH[2:])
-        create2_input = b"\xff" + factory_bytes + salt + init_hash
-        proxy_address = to_checksum_address(
-            "0x" + keccak(create2_input)[12:].hex()
-        )
-        log.info(f"[REDEEM L3] Derived proxy address: {proxy_address}")
-
-        # Verify the proxy address matches FUNDER_ADDRESS
-        if FUNDER_ADDRESS and proxy_address.lower() != FUNDER_ADDRESS.lower():
-            log.warning(
-                f"[REDEEM L3] Derived proxy {proxy_address} != FUNDER_ADDRESS {FUNDER_ADDRESS}.\n"
-                f"             Using FUNDER_ADDRESS from env as the proxy address."
-            )
-            proxy_address = to_checksum_address(FUNDER_ADDRESS)
+        # Use FUNDER_ADDRESS directly as the proxy wallet address.
+        # FUNDER_ADDRESS IS the proxy contract address — it was set in .env
+        # from the address shown on polymarket.com. No derivation needed.
+        if not FUNDER_ADDRESS:
+            log.warning("[REDEEM L3] FUNDER_ADDRESS not set in .env — cannot locate proxy contract.")
+            return False
+        proxy_address = to_checksum_address(FUNDER_ADDRESS)
+        log.info(f"[REDEEM L3] Using proxy wallet: {proxy_address}")
 
         # Polymarket Proxy ABI — forward(address to, bytes data, uint256 value)
         # This is the function that executes arbitrary calls through the proxy
