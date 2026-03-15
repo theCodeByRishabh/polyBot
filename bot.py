@@ -111,7 +111,7 @@ PARENT_COLLECTION_ID = "0x" + ("00" * 32)
 RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RELAYER_URL") or "https://relayer-v2.polymarket.com/"
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-STAKE             = 6.00    # Fixed $6.00 per trade (min 5 shares at 0.93+ price)
+STAKE             = 5.00    # Fixed $6.00 per trade (min 5 shares at 0.93+ price)
 BASE_THRESHOLD    = 0.95    # Buy when dominant side ask >= 95%
 ADAPTIVE_THRESH   = 0.98    # Raised after 2 consecutive losses
 ENTRY_WINDOW_SEC  = 30      # Enter any time price >= threshold AND <=30s remain
