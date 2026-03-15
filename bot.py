@@ -218,6 +218,11 @@ class BotState:
     last_market_scan: float       = 0.0
     last_status_ts: float         = 0.0    # deduplicate status log lines
     redeemed_condition_ids: set   = field(default_factory=set)  # prevent double-redeem
+    # ── Compounding stake ─────────────────────────────────────────────────────
+    # Starts at BASE_STAKE ($5). On win: next stake = BASE_STAKE + last net profit.
+    # On loss / stop-loss: resets back to BASE_STAKE.
+    current_stake: float          = 5.00   # live stake for next trade (updated after each outcome)
+    last_net_profit: float        = 0.0    # net profit from the last winning trade
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
 def load_trades() -> list:
@@ -647,15 +652,17 @@ async def liquidity_ok(session: aiohttp.ClientSession, token_id: str, price: flo
     return False
 
 # ─── Order execution ──────────────────────────────────────────────────────────
-def presign_order(client: ClobClient, market: Market, token_id: str, price: float):
+def presign_order(client: ClobClient, market: Market, token_id: str, price: float, stake: float = None):
     """Build and EIP-712 sign the BUY limit order at T-40s so it's ready to POST at fire time.
     Uses GTC limit order at ask price — acts as taker if book has supply, else rests briefly.
     """
+    if stake is None:
+        stake = STAKE
     try:
-        raw_size = STAKE / price
+        raw_size = stake / price
         size = math.ceil(raw_size * 100) / 100  # round UP to 2 decimal places
         size = max(size, 5.0)  # enforce minimum 5 shares
-        log.info(f"  Order size: {size} shares @ {price} (${size*price:.4f})")
+        log.info(f"  Order size: {size} shares @ {price} (${size*price:.4f}) [stake=${stake:.4f}]")
         order_args = OrderArgs(
             token_id = token_id,
             price    = price,
@@ -1067,9 +1074,9 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             signal = get_signal(state.market, state.price_history, state.consecutive_losses, time_left)
             if signal:
                 side, token_id, price = signal
-                state.presigned_order = presign_order(client, state.market, token_id, price)
+                state.presigned_order = presign_order(client, state.market, token_id, price, stake=state.current_stake)
                 state.presigned_for   = token_id
-                log.info(f"Pre-signed at T-{time_left}s: {side.upper()} @ {price:.4f}")
+                log.info(f"Pre-signed at T-{time_left}s: {side.upper()} @ {price:.4f} [stake=${state.current_stake:.4f}]")
 
         # ── ENTRY WINDOW: T-30s to T-3s ───────────────────────────────────
         if MIN_FIRE_BUFFER < time_left <= ENTRY_WINDOW_SEC and not state.trade_fired:
@@ -1087,7 +1094,7 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
                 continue
 
             side, token_id, price = signal
-            log.info(f"SIGNAL @ T-{time_left}s: BTC {side.upper()} ask={price:.4f}")
+            log.info(f"SIGNAL @ T-{time_left}s: BTC {side.upper()} ask={price:.4f} | stake=${state.current_stake:.4f}")
 
             # Gate 1: spread — retry each tick, don't permanently skip
             # Spread can widen temporarily then narrow back within the 30s window
@@ -1110,8 +1117,8 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             # Gate 4: balance
             bal = get_balance(client)
             state.last_balance = bal
-            if bal < STAKE:
-                log.error(f"Insufficient funds: ${bal:.4f} < ${STAKE:.2f}")
+            if bal < state.current_stake:
+                log.error(f"Insufficient funds: ${bal:.4f} < ${state.current_stake:.2f} (current stake)")
                 state.trade_fired = True
                 _log_skip(state.market, side, price, "insufficient_funds", bal)
                 continue
@@ -1135,6 +1142,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
     - Attempts 2+: re-signs fresh order each time (signature may have expired)
     - Stops if time_left drops to MIN_FIRE_BUFFER or position filled
     """
+    stake = state.current_stake  # snapshot compound stake for this trade
     attempt = 0
     deadline = time.time() + max(time_left - MIN_FIRE_BUFFER, 2)
     last_order_status = ""   # track final accepted status to skip cancel on matched orders
@@ -1153,7 +1161,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
             log.info(f"  Buy attempt 1 (presigned) @ T-{now_left}s price={price:.4f}")
         else:
             # Re-sign fresh order for all retries
-            order = presign_order(client, state.market, token_id, price)
+            order = presign_order(client, state.market, token_id, price, stake=stake)
             if not order:
                 log.warning(f"  Attempt {attempt}: presign failed, retrying in 1s...")
                 await asyncio.sleep(1)
@@ -1249,7 +1257,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
                  f"balance poll did not confirm fill in time.")
         # Even though balance poll timed out, the order DID match — treat as filled
         # using the expected spend amount so the position is tracked and redeemed.
-        shares = round(STAKE / price, 6)
+        shares = round(stake / price, 6)
         bal_after_attempt = get_balance(client)
         log.warning(f"  ⚠️ FORCE-SETTING position from accepted order: "
                     f"shares={shares:.6f} @ {price:.4f} | bal_before=${bal_before:.4f} bal_now=${bal_after_attempt:.4f}")
@@ -1262,7 +1270,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
         save_trade(TradeRecord(
             cycle_id=state.position.cycle_id, side=side,
             entry_price=price, exit_price=0,
-            shares_held=shares, stake=STAKE, outcome="open",
+            shares_held=shares, stake=stake, outcome="open",
             payout=0, gross_profit=0, fee_usdc=0, net_profit=0,
             balance_before=bal_before, balance_after=bal_after_attempt,
             market_slug=state.market.slug, timestamp=_ts(),
@@ -1272,7 +1280,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
     log.info(f"Buy unmatched after {attempt} attempt(s) — no fill.")
     save_trade(TradeRecord(
         cycle_id=_cycle_id(), side=side, entry_price=price, exit_price=0,
-        shares_held=0, stake=STAKE, outcome="unmatched",
+        shares_held=0, stake=stake, outcome="unmatched",
         payout=0, gross_profit=0, fee_usdc=0, net_profit=0,
         balance_before=bal_before, balance_after=bal_before,
         market_slug=state.market.slug, timestamp=_ts(),
@@ -1801,7 +1809,9 @@ async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, 
     won  = (state.resolved == pos.token_id)
     outcome = "win" if won else "loss"
     fee_bps = float(state.market.fee_rate or 0)
-    payout, gross, fee_usdc, net = calc_profit(STAKE, pos.entry_price, 1.0, fee_bps, outcome)
+    # Use the actual stake that was placed (pos.stake), not the global STAKE constant
+    trade_stake = pos.stake if pos.stake and pos.stake > 0 else state.current_stake
+    payout, gross, fee_usdc, net = calc_profit(trade_stake, pos.entry_price, 1.0, fee_bps, outcome)
 
     bal_before = state.last_balance
     if won:
@@ -1810,9 +1820,17 @@ async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, 
             state.consecutive_losses = 0
             state.consecutive_wins   = 0
             log.info("[STREAK] 5 consecutive wins — adaptive threshold reset to base.")
+        # ── Compounding: next stake = BASE_STAKE + net profit from this win ──
+        state.last_net_profit  = net
+        state.current_stake    = round(STAKE + net, 4)
+        log.info(f"[COMPOUND] WIN — next stake: ${STAKE:.2f} + ${net:.4f} profit = ${state.current_stake:.4f}")
     else:
         state.consecutive_losses += 1
         state.consecutive_wins   = 0
+        # ── Compounding: reset stake to BASE_STAKE on loss ────────────────
+        state.last_net_profit = 0.0
+        state.current_stake   = STAKE
+        log.info(f"[COMPOUND] LOSS — stake reset to base ${STAKE:.2f}")
 
     log.info(f"{'WIN ✅' if won else 'LOSS ❌'}: gross={gross:+.4f} fee={fee_usdc:.5f} net={net:+.4f}")
 
@@ -1952,7 +1970,7 @@ def _save_resolved_trade(pos, outcome, payout, gross, fee_usdc, net, bal_before,
     save_trade(TradeRecord(
         cycle_id=pos.cycle_id, side=pos.side,
         entry_price=pos.entry_price, exit_price=1.0 if outcome == "win" else 0.0,
-        shares_held=pos.shares, stake=STAKE, outcome=outcome,
+        shares_held=pos.shares, stake=pos.stake if pos.stake and pos.stake > 0 else STAKE, outcome=outcome,
         payout=payout, gross_profit=gross, fee_usdc=fee_usdc, net_profit=net,
         balance_before=bal_before, balance_after=bal_after,
         market_slug=pos.market.slug, timestamp=_ts(),
@@ -1987,15 +2005,20 @@ async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
 
     actual_exit = exit_bid
     fee_bps = float(state.market.fee_rate or 0)
-    payout, gross, fee_usdc, net = calc_profit(STAKE, pos.entry_price, actual_exit, fee_bps, "stop_loss")
+    trade_stake = pos.stake if pos.stake and pos.stake > 0 else state.current_stake
+    payout, gross, fee_usdc, net = calc_profit(trade_stake, pos.entry_price, actual_exit, fee_bps, "stop_loss")
     state.consecutive_losses += 1
     state.consecutive_wins   = 0
+    # ── Compounding: reset stake to BASE_STAKE on stop-loss ──────────────────
+    state.last_net_profit = 0.0
+    state.current_stake   = STAKE
+    log.info(f"[COMPOUND] STOP-LOSS — stake reset to base ${STAKE:.2f}")
 
     log.info(f"✅ STOP-LOSS executed: entry={pos.entry_price:.4f} exit={actual_exit:.4f} | "
              f"gross={gross:+.4f} net={net:+.4f} | balance ${bal_before:.4f} → ${bal_after:.4f}")
     save_trade(TradeRecord(
         cycle_id=pos.cycle_id, side=pos.side, entry_price=pos.entry_price,
-        exit_price=actual_exit, shares_held=pos.shares, stake=STAKE,
+        exit_price=actual_exit, shares_held=pos.shares, stake=trade_stake,
         outcome="stop_loss", payout=payout, gross_profit=gross,
         fee_usdc=fee_usdc, net_profit=net,
         balance_before=bal_before, balance_after=bal_after,
@@ -2202,7 +2225,8 @@ async def run_bot():
         loop.add_signal_handler(sig, stop.set)
 
     log.info("=" * 65)
-    log.info(" Polymarket BTC 5m Bot v8  —  $6 fixed | 95% threshold | Sell retry + position guard")
+    log.info(" Polymarket BTC 5m Bot v8  —  Compounding stake | 95% threshold | Sell retry + position guard")
+    log.info(f" Stake: base=${STAKE:.2f} | compounds on WIN (base + net profit), resets on LOSS/STOP-LOSS")
     log.info(f" Buy: >= {BASE_THRESHOLD*100:.0f}% (adaptive {ADAPTIVE_THRESH*100:.0f}% after 2 losses)")
     log.info(f" Stop-loss: sell if bid < {STOP_LOSS_BID*100:.0f}% AND > {STOP_LOSS_MIN_SEC}s remain")
     log.info(f" Filters: spread<{MAX_SPREAD} | liq>${MIN_LIQUIDITY} | vol-momentum | presign@T-{PRESIGN_BEFORE}s")
