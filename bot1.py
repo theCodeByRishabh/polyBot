@@ -1,21 +1,8 @@
 """
-Polymarket BTC 5-Minute Bot — v7 (stability & bug fixes)
+Polymarket BTC 5-Minute Bot — v6 (redeem overhaul)
 
-Changes vs v6:
-  BUG FIXES
-  1. CLOB API creds now refreshed every 6h via background task — prevents silent 401 after ~24h uptime
-  2. _clock_offset / _last_sync / _last_market_scan moved into BotState proper fields (no more monkey-patching)
-  3. consecutive_losses no longer incorrectly increments on skip/unmatched — only real losses count
-  4. WSS ping task always cancelled in finally block — no more zombie coroutines on reconnect
-
-  PERFORMANCE
-  5. save_trade() now appends to JSON file instead of read-entire-file on every write — O(1) not O(n)
-  6. Status log uses a deduplicated last_status_ts instead of int(time_left)%5 — no duplicate log spam
-  7. BalanceAllowanceParams import moved to top-level — not re-imported on every balance check
-
-  CLEANUP
-  8. STAKE comment corrected ($6.00, not $5.00)
-  9. refresh_creds() wired into a periodic background task (runs every 6h)
+Changes vs v5:
+  All trading logic is UNCHANGED.
 
 REDEEM OVERHAUL (v6):
   Root cause of v5 redeem failures:
@@ -56,10 +43,10 @@ REDEEM OVERHAUL (v6):
     POLYGON_RPC_URL=...      # Optional: custom RPC (defaults to public endpoints)
 """
 
-import os, json, time, logging, statistics, asyncio, signal, math
+import os, json, time, logging, statistics, asyncio, signal
 from collections import deque
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -77,7 +64,6 @@ import aiohttp
 import websockets
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import AssetType, OrderArgs, MarketOrderArgs, OrderType, BalanceAllowanceParams
-# BalanceAllowanceParams imported above — do not re-import inside get_balance()
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -101,14 +87,14 @@ PARENT_COLLECTION_ID = "0x" + ("00" * 32)
 RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RELAYER_URL") or "https://relayer-v2.polymarket.com/"
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-STAKE             = 6.00    # Fixed $6.00 per trade (min 5 shares at 0.93+ price)
-BASE_THRESHOLD    = 0.93    # Buy when dominant side ask >= 93%
-ADAPTIVE_THRESH   = 0.97    # Raised after 2 consecutive losses
+STAKE             = 6.00    # Fixed $5.00 per trade (min 5 shares at 0.93+ price)
+BASE_THRESHOLD    = 0.94    # Buy when dominant side ask >= 93%
+ADAPTIVE_THRESH   = 0.98    # Raised after 2 consecutive losses
 ENTRY_WINDOW_SEC  = 30      # Enter any time price >= threshold AND <=30s remain
 PRESIGN_BEFORE    = 40      # Build signed order at T-40s (removes signing latency)
 MIN_FIRE_BUFFER   = 3       # Never fire if < 3s remain (too risky)
-STOP_LOSS_BID     = 0.60    # Exit position if best_bid falls below this
-STOP_LOSS_MIN_SEC = 5       # Don't stop-loss if < 5s remain (just let it resolve)
+STOP_LOSS_BID     = 0.70    # Exit position if best_bid falls below this
+STOP_LOSS_MIN_SEC = 2       # Don't stop-loss if < 5s remain (just let it resolve)
 STABILITY_N       = 5       # Price ticks needed for stability check
 MAX_STD_DEV       = 0.015   # Max std-dev for stability
 MIN_LIQUIDITY     = 3.0     # Min USDC ask depth
@@ -185,36 +171,18 @@ class BotState:
     consecutive_losses: int       = 0
     exchange_disabled: bool       = False
     last_balance: float           = 0.0
-    # Clock sync — proper fields instead of monkey-patched attrs
-    clock_offset: float           = 0.0
-    last_sync: float              = 0.0
-    last_market_scan: float       = 0.0
-    last_status_ts: float         = 0.0    # deduplicate status log lines
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
 def load_trades() -> list:
-    """Read all trade records. Supports both legacy JSON array and NDJSON formats."""
-    if not TRADES_FILE.exists():
-        return []
-    try:
-        text = TRADES_FILE.read_text().strip()
-        if not text:
-            return []
-        # Try NDJSON first (new format — one JSON object per line)
-        if text.startswith("{"):
-            return [json.loads(line) for line in text.splitlines() if line.strip()]
-        # Legacy format: single JSON array
-        return json.loads(text)
-    except Exception:
-        return []
+    if TRADES_FILE.exists():
+        try:    return json.loads(TRADES_FILE.read_text())
+        except: return []
+    return []
 
 def save_trade(r: TradeRecord):
-    """Append trade record to JSON file without loading the whole file into RAM.
-    Uses a newline-delimited JSON (NDJSON) append for O(1) writes.
-    load_trades() still returns a proper list for compatibility.
-    """
-    with TRADES_FILE.open("a") as f:
-        f.write(json.dumps(asdict(r)) + "\n")
+    trades = load_trades()
+    trades.append(asdict(r))
+    TRADES_FILE.write_text(json.dumps(trades, indent=2))
 
 # ─── CLOB client ──────────────────────────────────────────────────────────────
 def build_client() -> ClobClient:
@@ -238,9 +206,17 @@ def build_client() -> ClobClient:
             time.sleep(delay)
             delay = min(delay * 2, 60)
 
+def refresh_creds(client: ClobClient):
+    try:
+        client.set_api_creds(client.create_or_derive_api_creds())
+        log.info("Credentials refreshed.")
+    except Exception as e:
+        log.error(f"Credential refresh failed: {e}")
+
 # ─── Balance ──────────────────────────────────────────────────────────────────
 def get_balance(client: ClobClient) -> float:
     try:
+        from py_clob_client.clob_types import BalanceAllowanceParams
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=1)
         resp = client.get_balance_allowance(params=params)
         raw = float(resp.get("balance", 0))
@@ -301,23 +277,6 @@ async def heartbeat_loop(client: ClobClient, state: BotState, stop: asyncio.Even
             else:
                 log.warning(f"Heartbeat error: {e}")
         await asyncio.sleep(5)
-
-async def cred_refresh_loop(client: ClobClient, stop: asyncio.Event):
-    """Refresh CLOB API credentials every 6 hours.
-    CLOB API keys expire after ~24h. Refreshing proactively prevents silent
-    401 errors that would stop the bot from placing orders mid-session.
-    """
-    REFRESH_INTERVAL = 6 * 3600  # 6 hours
-    await asyncio.sleep(REFRESH_INTERVAL)  # first refresh after 6h
-    while not stop.is_set():
-        try:
-            client.set_api_creds(client.create_or_derive_api_creds())
-            log.info("[CREDS] ✅ CLOB API credentials refreshed successfully.")
-        except Exception as e:
-            log.warning(f"[CREDS] Credential refresh failed (will retry in 1h): {e}")
-            await asyncio.sleep(3600)
-            continue
-        await asyncio.sleep(REFRESH_INTERVAL)
 
 # ─── Market discovery ─────────────────────────────────────────────────────────
 async def fetch_btc_market(session: aiohttp.ClientSession, server_ts: int) -> Optional[Market]:
@@ -582,6 +541,7 @@ def presign_order(client: ClobClient, market: Market, token_id: str, price: floa
     Uses GTC limit order at ask price — acts as taker if book has supply, else rests briefly.
     """
     try:
+        import math
         raw_size = STAKE / price
         size = math.ceil(raw_size * 100) / 100  # round UP to 2 decimal places
         size = max(size, 5.0)  # enforce minimum 5 shares
@@ -595,6 +555,29 @@ def presign_order(client: ClobClient, market: Market, token_id: str, price: floa
         return client.create_order(order_args)
     except Exception as e:
         log.error(f"Presign error: {e}")
+        return None
+
+async def execute_buy(client: ClobClient, market: Market, token_id: str,
+                      side: str, price: float, state: BotState) -> Optional[dict]:
+    """Post the pre-signed (or freshly signed) BUY FOK order."""
+    order = (state.presigned_order if state.presigned_for == token_id
+             else presign_order(client, market, token_id, price))
+    if not order:
+        return None
+
+    log.info(f"BUYING: BTC {side.upper()} ${STAKE:.2f} GTC limit @ {price:.4f}")
+    try:
+        resp = await with_retry(lambda: client.post_order(order, OrderType.GTC), "buy_order")
+        log.info(f"  Buy response: {resp}")
+        return resp
+    except ExchangeDisabledError:
+        state.exchange_disabled = True
+        return None
+    except InsufficientFundsError:
+        log.error(f"Insufficient funds. Balance: ${state.last_balance:.4f}")
+        return None
+    except Exception as e:
+        log.error(f"Buy order error: {e}")
         return None
 
 async def execute_sell(client: ClobClient, market: Market, position: Position,
@@ -663,6 +646,13 @@ def calc_profit(stake, entry_price, exit_price, fee_rate_bps, outcome):
     fee_usdc = shares * fee_rate * (entry_price * (1 - entry_price)) ** 2
     net      = gross - fee_usdc
     return round(payout,6), round(gross,6), round(fee_usdc,6), round(net,6)
+
+# ─── Resolution via WSS ───────────────────────────────────────────────────────
+async def wait_for_wss_resolution(state: BotState, timeout: int = 180) -> Optional[str]:
+    deadline = time.time() + timeout
+    while time.time() < deadline and state.resolved is None:
+        await asyncio.sleep(1)
+    return state.resolved
 
 # ─── WebSocket ────────────────────────────────────────────────────────────────
 async def run_market_wss(state: BotState, client: ClobClient,
@@ -802,16 +792,14 @@ async def run_market_wss(state: BotState, client: ClobClient,
                         elif etype and etype not in ("book",):
                             log.debug(f"[WSS] unhandled event: {etype}")
 
+                ping_t.cancel()
         except Exception as e:
             if not stop.is_set():
                 log.warning(f"[WSS] dropped (reconnect in 2s): {e}")
                 await asyncio.sleep(2)
         finally:
-            # Always cancel ping task and clear slug so outer loop reconnects.
-            try:
-                ping_t.cancel()
-            except Exception:
-                pass
+            # Always clear current_slug so outer loop reconnects to
+            # whatever market is now active (new or same after error).
             current_slug = None
 
 async def _wss_ping(ws, stop):
@@ -835,8 +823,8 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
         if not state.market:
             # Poll for market every 15s — don't rely solely on WSS new_market event
             now = int(time.time())
-            if now - state.last_market_scan > 15:
-                state.last_market_scan = now
+            if not hasattr(state, '_last_market_scan') or now - state._last_market_scan > 15:
+                state._last_market_scan = now
                 log.info("[LOOP] No market loaded — polling Gamma API...")
                 m = await fetch_btc_market(session, now)
                 if m:
@@ -848,20 +836,18 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
 
         # Use local clock + server offset — sync with server every 30s instead of every second
         now_local = time.time()
-        if now_local - state.last_sync > 30:
+        if not hasattr(state, '_clock_offset') or now_local - getattr(state, '_last_sync', 0) > 30:
             try:
-                server_ts_raw = int(await asyncio.to_thread(client.get_server_time))
-                state.clock_offset = server_ts_raw - now_local
-                state.last_sync    = now_local
+                server_ts_raw = int(client.get_server_time())
+                state._clock_offset = server_ts_raw - now_local
+                state._last_sync = now_local
             except Exception:
-                pass  # keep existing offset on failure
-        server_ts = int(now_local + state.clock_offset)
+                state._clock_offset = getattr(state, '_clock_offset', 0.0)
+        server_ts = int(now_local + getattr(state, '_clock_offset', 0.0))
         time_left = state.market.end_ts - server_ts
 
-        # Log status every 5s — use wall-clock timer to avoid duplicate logs
-        now_wall = time.time()
-        if now_wall - state.last_status_ts >= 5.0:
-            state.last_status_ts = now_wall
+        # Log status every 5s
+        if int(time_left) % 5 == 0:
             ups = [t.best_ask for t in state.price_history if t.token_id == state.market.up_token_id]
             dns = [t.best_ask for t in state.price_history if t.token_id == state.market.down_token_id]
             tick_count = len(state.price_history)
@@ -923,8 +909,8 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             signal = get_signal(state.market, state.price_history, state.consecutive_losses)
 
             if not signal:
-                # Log every 5s via wall-clock to avoid duplicate lines
-                if now_wall - state.last_status_ts >= 5.0:
+                if int(time_left) % 5 == 0:
+                    # Log current prices every 5s while in window
                     ups  = [t.best_ask for t in state.price_history if t.token_id == state.market.up_token_id]
                     dns  = [t.best_ask for t in state.price_history if t.token_id == state.market.down_token_id]
                     up_p = ups[-1] if ups else 0
@@ -969,12 +955,11 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             state.trade_fired = True
             await _do_buy(client, session, state, side, token_id, price, bal, time_left)
 
-        elif time_left > ENTRY_WINDOW_SEC:
-            # Waiting for entry window — log every 10s via wall-clock
-            if now_wall - state.last_status_ts >= 10.0:
-                ups = [t.best_ask for t in state.price_history if t.token_id == state.market.up_token_id]
-                dns = [t.best_ask for t in state.price_history if t.token_id == state.market.down_token_id]
-                log.info(f"  T-{time_left}s | UP={ups[-1]:.3f} DOWN={dns[-1]:.3f}" if ups and dns else f"  T-{time_left}s | waiting for price ticks...")
+        elif time_left > ENTRY_WINDOW_SEC and int(time_left) % 10 == 0:
+            # Waiting for entry window — log every 10s
+            ups = [t.best_ask for t in state.price_history if t.token_id == state.market.up_token_id]
+            dns = [t.best_ask for t in state.price_history if t.token_id == state.market.down_token_id]
+            log.info(f"  T-{time_left}s | UP={ups[-1]:.3f} DOWN={dns[-1]:.3f}" if ups and dns else f"  T-{time_left}s | waiting for price ticks...")
 
 # ─── Trade actions ────────────────────────────────────────────────────────────
 async def _do_buy(client, session, state: BotState, side, token_id, price, bal_before, time_left=30):
@@ -990,7 +975,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
 
     while time.time() < deadline:
         attempt += 1
-        now_left = state.market.end_ts - int(time.time() + state.clock_offset)
+        now_left = state.market.end_ts - int(time.time() + getattr(state, '_clock_offset', 0))
 
         if now_left <= MIN_FIRE_BUFFER:
             log.info(f"  Buy abort: only {now_left}s left, too close to close.")
@@ -1049,7 +1034,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
         if filled_amount > 0.01:
             break
         # Also stop polling if market has essentially closed
-        now_left = state.market.end_ts - int(time.time() + state.clock_offset)
+        now_left = state.market.end_ts - int(time.time() + getattr(state, '_clock_offset', 0))
         if now_left <= MIN_FIRE_BUFFER:
             break
         await asyncio.sleep(poll_interval)
@@ -1796,9 +1781,9 @@ async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
                         state: BotState, exit_bid: float):
     """Execute a stop-loss SELL when price crashes below 60%."""
     pos = state.position
-    bal_before = state.last_balance  # capture BEFORE the sell executes
     resp = await execute_sell(client, state.market, pos, exit_bid)
 
+    # Estimate exit price from bid (FAK may fill at slightly different price)
     actual_exit = exit_bid
     fee_bps = float(state.market.fee_rate or 0)
     payout, gross, fee_usdc, net = calc_profit(STAKE, pos.entry_price, actual_exit, fee_bps, "stop_loss")
@@ -1813,7 +1798,7 @@ async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
         exit_price=actual_exit, shares_held=pos.shares, stake=STAKE,
         outcome="stop_loss", payout=payout, gross_profit=gross,
         fee_usdc=fee_usdc, net_profit=net,
-        balance_before=bal_before, balance_after=bal_after,
+        balance_before=state.last_balance, balance_after=bal_after,
         market_slug=pos.market.slug, timestamp=_ts(),
     ))
 
@@ -1838,17 +1823,13 @@ async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, st
     except Exception as e:
         log.warning(f"[ADVANCE] Cancel orders: {e}")
 
-    try:
-        server_ts = int(await asyncio.to_thread(client.get_server_time))
-    except Exception:
-        server_ts = int(time.time() + state.clock_offset)
+    server_ts = int(client.get_server_time())
     state.trade_fired      = False
     state.resolved         = None
     state.presigned_order  = None
     state.presigned_for    = None
     state.position         = None  # always clear position on advance
     state.price_history    = deque(maxlen=200)
-    state.last_status_ts   = 0.0   # reset so status logs immediately on new cycle
 
     if state.next_market:
         m = await _gamma_slug(session, state.next_market.slug)
@@ -1895,7 +1876,7 @@ async def run_bot():
         loop.add_signal_handler(sig, stop.set)
 
     log.info("=" * 65)
-    log.info(" Polymarket BTC 5m Bot v7  —  $6 fixed | Entry window 30s | Redeem: 3-layer cascade")
+    log.info(" Polymarket BTC 5m Bot v6  —  $5 fixed | Entry window 30s | Redeem: 3-layer cascade")
     log.info(f" Buy: >= {BASE_THRESHOLD*100:.0f}% (adaptive {ADAPTIVE_THRESH*100:.0f}% after 2 losses)")
     log.info(f" Stop-loss: sell if bid < {STOP_LOSS_BID*100:.0f}% AND > {STOP_LOSS_MIN_SEC}s remain")
     log.info(f" Filters: spread<{MAX_SPREAD} | liq>${MIN_LIQUIDITY} | vol-momentum | presign@T-{PRESIGN_BEFORE}s")
@@ -1904,7 +1885,7 @@ async def run_bot():
 
     async with aiohttp.ClientSession() as session:
         # Clock sync check
-        server_ts = int(await asyncio.to_thread(client.get_server_time))
+        server_ts = int(client.get_server_time())
         drift = abs(time.time() - server_ts)
         status = "OK" if drift < 3 else f"WARNING — {drift:.1f}s drift may affect timing"
         log.info(f"Clock drift: {drift:.2f}s [{status}]")
@@ -1923,34 +1904,13 @@ async def run_bot():
         else:
             log.info("No market yet — will auto-detect via WSS new_market event.")
 
-        try:
-            await asyncio.gather(
-                run_market_wss(state, client, session, stop),
-                trading_loop(client, session, state, stop),
-                heartbeat_loop(client, state, stop),
-                cred_refresh_loop(client, stop),
-                return_exceptions=False,
-            )
-        except Exception as e:
-            if not stop.is_set():
-                log.error(f"Fatal coroutine error: {e}", exc_info=True)
-                # Outer restart loop in __main__ will handle recovery
+        await asyncio.gather(
+            run_market_wss(state, client, session, stop),
+            trading_loop(client, session, state, stop),
+            heartbeat_loop(client, state, stop),
+        )
 
     log.info("Bot stopped cleanly.")
 
 if __name__ == "__main__":
-    # Outer restart loop — if run_bot() crashes due to a fatal unhandled error,
-    # wait 10 seconds and restart rather than dying permanently on Railway.
-    import sys
-    RESTART_DELAY = 10
-    while True:
-        try:
-            asyncio.run(run_bot())
-            break  # clean stop (SIGINT/SIGTERM) — do not restart
-        except KeyboardInterrupt:
-            log.info("Keyboard interrupt — bot stopped.")
-            break
-        except Exception as e:
-            log.error(f"[CRASH] Bot crashed: {e}", exc_info=True)
-            log.error(f"[CRASH] Restarting in {RESTART_DELAY}s...")
-            time.sleep(RESTART_DELAY)
+    asyncio.run(run_bot())
