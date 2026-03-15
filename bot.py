@@ -101,18 +101,18 @@ PARENT_COLLECTION_ID = "0x" + ("00" * 32)
 RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RELAYER_URL") or "https://relayer-v2.polymarket.com/"
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-STAKE             = 5.00    # Fixed $5.00 per trade (min 5 shares at 0.93+ price)
-BASE_THRESHOLD    = 0.95    # Buy when dominant side ask >= 93%
+STAKE             = 6.00    # Fixed $5.00 per trade (min 5 shares at 0.93+ price)
+BASE_THRESHOLD    = 0.97   # Buy when dominant side ask >= 93%
 ADAPTIVE_THRESH   = 0.98    # Raised after 2 consecutive losses
 ENTRY_WINDOW_SEC  = 30      # Enter any time price >= threshold AND <=30s remain
 PRESIGN_BEFORE    = 40      # Build signed order at T-40s (removes signing latency)
-MIN_FIRE_BUFFER   = 3       # Never fire if < 3s remain (too risky)
-STOP_LOSS_BID     = 0.60    # Exit position if best_bid falls below this
+MIN_FIRE_BUFFER   = 5       # Never fire if < 3s remain (too risky)
+STOP_LOSS_BID     = 0.75    # Exit position if best_bid falls below this
 STOP_LOSS_MIN_SEC = 5       # Don't stop-loss if < 5s remain (just let it resolve)
 STABILITY_N       = 5       # Price ticks needed for stability check
 MAX_STD_DEV       = 0.015   # Max std-dev for stability
 MIN_LIQUIDITY     = 3.0     # Min USDC ask depth
-MAX_SPREAD        = 0.03    # Skip if bid-ask spread > 3¢
+MAX_SPREAD        = 0.04    # Skip if bid-ask spread > 3¢
 
 TRADES_FILE = Path("trades.json")
 
