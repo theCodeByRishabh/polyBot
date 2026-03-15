@@ -210,6 +210,7 @@ class BotState:
     last_sync: float              = 0.0
     last_market_scan: float       = 0.0
     last_status_ts: float         = 0.0    # deduplicate status log lines
+    redeemed_condition_ids: set   = field(default_factory=set)  # prevent double-redeem
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
 def load_trades() -> list:
@@ -2001,9 +2002,6 @@ async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, st
     except Exception as e:
         log.warning(f"[ADVANCE] Cancel orders: {e}")
 
-    # Scan for any redeemable orphan positions we may have missed this cycle
-    asyncio.create_task(_scan_and_redeem_orphans(session, client, state))
-
     try:
         server_ts = int(await asyncio.to_thread(client.get_server_time))
     except Exception:
@@ -2047,58 +2045,96 @@ async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, st
 def _ts(): return datetime.utcnow().isoformat() + "Z"
 def _cycle_id(): return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:00Z")
 
-async def _scan_and_redeem_orphans(session: aiohttp.ClientSession, client: ClobClient, state: BotState):
+async def redeem_loop(session: aiohttp.ClientSession, client: ClobClient,
+                     state: BotState, stop: asyncio.Event):
     """
-    Scan the Data API for any redeemable positions that the bot may have missed
-    (e.g. due to the status=matched / balance-poll-timeout bug).
-    Called at startup and after each market advance.
-    Fires a background redeem task for every redeemable position found.
+    Persistent background loop that catches any redeemable positions the trading
+    loop may have missed (e.g. status=matched + balance-poll-timeout bug, or
+    positions that weren't redeemable yet when the cycle advanced).
+
+    Design:
+      - Polls Data API once every 30s (well under any rate limit)
+      - Skips condition IDs already submitted this session (state.redeemed_condition_ids)
+      - Also skips the current active position's condition ID — _background_redeem
+        already owns that one
+      - Runs the L1→L2→L3 cascade once per new redeemable CID, then marks it done
+      - No concurrent tasks, no inner polling loop — one pass, move on
     """
+    SCAN_INTERVAL = 30   # seconds between scans
     funder = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
     if not funder:
+        log.warning("[REDEEM-LOOP] POLYMARKET_FUNDER_ADDRESS not set — orphan redeem loop disabled")
         return
-    try:
-        async with session.get(
-            "https://data-api.polymarket.com/positions",
-            params={"user": funder.lower(), "sizeThreshold": "0.01"},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r:
-            positions = await r.json() if r.status == 200 else []
 
-        if not isinstance(positions, list):
-            return
+    log.info(f"[REDEEM-LOOP] Started — scanning for orphan redeemable positions every {SCAN_INTERVAL}s")
 
-        redeemable = [p for p in positions if p.get("redeemable") is True]
-        if not redeemable:
-            log.info("[ORPHAN-SCAN] No redeemable orphan positions found.")
-            return
+    while not stop.is_set():
+        await asyncio.sleep(SCAN_INTERVAL)
+        if stop.is_set():
+            break
 
-        for p in redeemable:
-            cid  = p.get("conditionId", "")
-            size = p.get("size", "?")
-            if not cid:
+        try:
+            async with session.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": funder.lower(), "sizeThreshold": "0.01"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                positions = await r.json() if r.status == 200 else []
+
+            if not isinstance(positions, list):
                 continue
-            log.warning(f"[ORPHAN-SCAN] ⚠️ Found unredeemed position! "
-                        f"conditionId={cid[:20]}... size={size} — launching redeem task")
-            # Build a minimal stub Position so _background_redeem can log/save correctly
-            stub_market = state.market or Market(
-                slug="orphan", end_ts=0,
-                up_token_id="", down_token_id="", condition_id=cid,
-            )
-            stub_market.condition_id = cid
-            stub_pos = Position(
-                token_id="", side="unknown",
-                entry_price=0.0, shares=float(size) if isinstance(size, (int, float)) else 0.0,
-                cycle_id=_cycle_id(), market=stub_market,
-            )
-            asyncio.create_task(
-                _background_redeem(session, client, state, cid, stub_pos,
-                                   gross=0.0, fee_usdc=0.0, net=0.0,
-                                   bal_before=state.last_balance)
+
+            redeemable = [
+                p for p in positions
+                if p.get("redeemable") is True
+                and p.get("conditionId", "") not in state.redeemed_condition_ids
+            ]
+
+            if not redeemable:
+                continue  # nothing to do — no log spam
+
+            # Skip any CID that belongs to the current live position
+            # (_background_redeem already owns it)
+            active_cid = (
+                state.position.market.condition_id
+                if state.position and state.position.market
+                else ""
             )
 
-    except Exception as e:
-        log.warning(f"[ORPHAN-SCAN] scan failed: {e}")
+            for p in redeemable:
+                cid  = p.get("conditionId", "")
+                size = p.get("size", "?")
+                if not cid or cid == active_cid:
+                    continue
+
+                log.warning(f"[REDEEM-LOOP] ⚠️ Orphan redeemable: conditionId={cid[:20]}... "
+                            f"size={size} — submitting cascade")
+
+                # Mark as seen BEFORE cascade so we don't retry on next scan
+                # even if cascade fails (avoids hammering a broken condition)
+                state.redeemed_condition_ids.add(cid)
+
+                l1_ok = await asyncio.to_thread(_redeem_via_relayer, cid)
+                if l1_ok:
+                    log.info(f"[REDEEM-LOOP] ✅ L1 submitted for {cid[:20]}...")
+                    continue
+
+                l2_ok = await asyncio.to_thread(_redeem_via_poly_web3, cid)
+                if l2_ok:
+                    log.info(f"[REDEEM-LOOP] ✅ L2 submitted for {cid[:20]}...")
+                    continue
+
+                l3_ok = await asyncio.to_thread(_redeem_via_proxy_forward, cid)
+                if l3_ok:
+                    log.info(f"[REDEEM-LOOP] ✅ L3 submitted for {cid[:20]}...")
+                else:
+                    log.warning(f"[REDEEM-LOOP] ⚠️ All layers failed for {cid[:20]}... "
+                                f"— claim manually at polymarket.com")
+                    # Remove from seen set so next scan retries it
+                    state.redeemed_condition_ids.discard(cid)
+
+        except Exception as e:
+            log.warning(f"[REDEEM-LOOP] scan error: {e}")
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 async def run_bot():
@@ -2135,7 +2171,7 @@ async def run_bot():
             log.warning(f"Balance shows ${state.last_balance:.4f} — if funded, SDK may be misreading. Continuing...")
 
         # Scan for any redeemable positions missed by previous runs (e.g. status=matched bug)
-        await _scan_and_redeem_orphans(session, client, state)
+        # Handled by redeem_loop which starts immediately in asyncio.gather below.
 
         # Bootstrap first market
         m = await fetch_btc_market(session, server_ts)
@@ -2151,6 +2187,7 @@ async def run_bot():
                 trading_loop(client, session, state, stop),
                 heartbeat_loop(client, state, stop),
                 cred_refresh_loop(client, stop),
+                redeem_loop(session, client, state, stop),
                 return_exceptions=False,
             )
         except Exception as e:
