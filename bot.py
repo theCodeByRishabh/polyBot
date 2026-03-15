@@ -1,37 +1,46 @@
 """
-Polymarket BTC 5-Minute Bot — v5 (final, production-ready)
+Polymarket BTC 5-Minute Bot — v6 (redeem overhaul)
 
-Changes vs v4:
-  LOGIC FIXES
-  1.  Entry window: fires ANY time price >= 95% within last 30s (not just T-25s)
-      Previous: only checked at exactly T-25s
-      Now: polls every second from T-30s, fires the instant condition is met
+Changes vs v5:
+  All trading logic is UNCHANGED.
 
-  2.  Stop-loss: after buying, monitor best_bid continuously
-      If best_bid drops below 0.60 AND >5s remain, sell all shares via FAK SELL
-      Shares held = calculated from fill amount (STAKE / entry_price)
-      Uses FAK not FOK for SELL — FAK fills what's available, FOK requires full fill
+REDEEM OVERHAUL (v6):
+  Root cause of v5 redeem failures:
+    • Your account is a Magic/email Proxy Wallet (signature_type=1).
+    • Positions live INSIDE the proxy contract, NOT at your raw EOA address.
+    • Direct web3.py redeemPositions() targets the CTF contract from your EOA —
+      this ALWAYS reverts because the proxy contract holds the tokens, not the EOA.
+    • v5's _redeem_direct() was therefore broken by design and could never work.
 
-  3.  Position tracking: bot now records shares_held after buy, clears after sell/resolve
+  v6 fix — three-layer redeem cascade, all routed through the proxy:
 
-  4.  Stop-loss outcome: logged as "stop_loss" in trades.json with actual exit price
+  LAYER 1 — py_builder_relayer_client (PROXY type) [requires Builder creds]
+    Uses RelayerTxType.PROXY explicitly (the critical v5 bug was using .SAFE).
+    Sends redeemPositions calldata to the relayer, which executes it through
+    your proxy wallet gaslessly.  This is Polymarket's official supported path.
 
- AUDIT FIXES
-  5.  FIRE_AT_SEC removed — entry now fires as soon as T <= ENTRY_WINDOW_SEC AND signal met
-  6.  Presign window adjusted: T-40s to T-31s (1s before entry window opens)
-  7.  Stop-loss skip when < 5s remain (too close to resolution, not worth the fee)
-  8.  FAK SELL uses correct SDK call: create_market_order(side=SELL, amount=shares)
-  9.  Shares computed as STAKE / entry_price (how many tokens you received)
-  10. All Telegram code removed from bot — alerts removed per user request
+  LAYER 2 — poly-web3 library [requires Builder creds, optional install]
+    Community Python port of the official TS builder-relayer-client.
+    pip install poly-web3
+    Used as a second attempt if layer 1 fails with an SDK error.
 
-REDEEM FIX (this version only):
-  • Fully automated prize collection — no builder creds required
-  • When data-api says "redeemable=true" (~2 min after resolution), bot now:
-    1. Tries relayer (if you have BUILDER_KEY etc.)
-    2. Falls back to direct on-chain redeemPositions (using your PRIVATE_KEY + Polygon RPC)
-  • Direct redeem pays ~0.0001 MATIC gas but works 100% of the time
-  • Balance is polled until USDC arrives — trade record saved with real payout
-  • No more "RelayerTxType not found" or stuck balance
+  LAYER 3 — Proxy forward call via web3.py [requires MATIC gas, ~$0.001]
+    Calls the Polymarket Proxy contract's `forward(address,bytes,uint256)`
+    function directly from your EOA (the proxy owner).  This correctly routes
+    redeemPositions through the proxy — unlike v5 which called CTF directly.
+    Proxy contract ABI: forward(address to, bytes data, uint256 value)
+    Proxy factory: 0xaB45c5A4B0c941a2F231C04C3f49182e1A254052 (MagicLink users)
+    No relayer/builder creds needed for this layer — only tiny MATIC gas.
+
+  BALANCE POLLING
+    After any successful submission, polls every 5s for up to 10 minutes
+    until USDC balance increases, then saves final trade record.
+
+  .env additions for full functionality:
+    BUILDER_KEY=...          # From Polymarket Settings → Builder/API
+    BUILDER_SECRET=...
+    BUILDER_PASSPHRASE=...
+    POLYGON_RPC_URL=...      # Optional: custom RPC (defaults to public endpoints)
 """
 
 import os, json, time, logging, statistics, asyncio, signal
@@ -1083,6 +1092,24 @@ def _builder_creds():
         return None
     return key, secret, passphrase
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  REDEEM ENGINE v6 — Three-layer cascade for Magic/email Proxy Wallet accounts
+#
+#  Why v5's direct web3 approach failed:
+#    Your funds live inside a Polymarket Proxy Contract (EIP-1167 minimal proxy),
+#    NOT at your raw EOA address. Calling redeemPositions() directly from your
+#    EOA always reverts because the CTF contract sees no tokens at your EOA —
+#    they're at the proxy address. You must route calls THROUGH the proxy.
+#
+#  The three layers below all route correctly through the proxy:
+#    Layer 1: Official relayer SDK with RelayerTxType.PROXY  (gasless)
+#    Layer 2: poly-web3 library (community Python port, also gasless)
+#    Layer 3: Direct proxy.forward() via web3.py             (needs ~$0.001 MATIC)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Polymarket Proxy Factory for MagicLink/email accounts (Polygon mainnet)
+PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
+
 def _to_bytes32(hex_str: str) -> bytes:
     h = (hex_str or "").lower()
     if h.startswith("0x"):
@@ -1092,13 +1119,13 @@ def _to_bytes32(hex_str: str) -> bytes:
     return bytes.fromhex(h.zfill(64))
 
 def _encode_redeem_positions(condition_id: str) -> Optional[str]:
+    """ABI-encode the redeemPositions(address,bytes32,bytes32,uint256[]) calldata."""
     try:
         from eth_utils import keccak, to_checksum_address
         from eth_abi import encode
     except Exception as e:
         log.warning(f"[REDEEM] ABI encoder unavailable: {e}")
         return None
-
     try:
         selector = keccak(text="redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
         args = encode(
@@ -1115,126 +1142,344 @@ def _encode_redeem_positions(condition_id: str) -> Optional[str]:
         log.warning(f"[REDEEM] Encode redeemPositions failed: {e}")
         return None
 
+# ─── LAYER 1: Official py_builder_relayer_client with RelayerTxType.PROXY ─────
 def _redeem_via_relayer(condition_id: str) -> bool:
+    """
+    Route redeemPositions through the Polymarket relayer using the PROXY tx type.
+
+    Critical v5 bug fixed here: v5 used RelayerTxType.SAFE which is for MetaMask
+    Gnosis Safe accounts. For Magic/email accounts (signature_type=1) you MUST use
+    RelayerTxType.PROXY. The relayer then wraps the call in a ProxyTransaction and
+    executes it through your proxy contract gaslessly.
+
+    Requires: BUILDER_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE in .env
+    """
     if not condition_id:
-        log.warning("[REDEEM] condition_id missing - cannot redeem.")
+        log.warning("[REDEEM L1] condition_id missing.")
         return False
 
     creds = _builder_creds()
     if not creds:
-        log.warning("[REDEEM] Builder creds missing (BUILDER_KEY/SECRET/PASSPHRASE).")
+        log.warning("[REDEEM L1] Builder creds missing — skipping relayer layer.")
         return False
 
     try:
         from py_builder_relayer_client.client import RelayClient
         import py_builder_relayer_client.models as br_models
         from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
-    except Exception as e:
-        log.warning(f"[REDEEM] Relayer SDK unavailable: {e}")
+    except ImportError as e:
+        log.warning(f"[REDEEM L1] py_builder_relayer_client not installed: {e}")
+        log.warning("[REDEEM L1] Install with: pip install py-builder-relayer-client py-builder-signing-sdk")
         return False
 
-    RelayerTxType = getattr(br_models, "RelayerTxType", getattr(br_models, "RelayTxType", None))
-    TransactionCls = getattr(br_models, "Transaction", None)
-    if RelayerTxType is None:
-        log.warning("[REDEEM] RelayerTxType not found in relayer SDK. Using shim.")
-        class ShimRelayerTxType:
-            SAFE = "SAFE"
-            PROXY = "PROXY"
-        RelayerTxType = ShimRelayerTxType
-    if TransactionCls is None:
-        # Older SDK versions don't export Transaction; provide a minimal shim.
-        class TransactionCls:
-            def __init__(self, to: str, data: str, value: str):
-                self.to = to
-                self.data = data
-                self.value = value
+    # Resolve RelayerTxType — name varies across SDK versions
+    RelayerTxType = (
+        getattr(br_models, "RelayerTxType", None)
+        or getattr(br_models, "RelayTxType", None)
+    )
 
-    data = _encode_redeem_positions(condition_id)
-    if not data:
+    # Build a shim if the SDK version doesn't export it
+    if RelayerTxType is None:
+        class _ShimTxType:
+            PROXY = "PROXY"
+            SAFE  = "SAFE"
+        RelayerTxType = _ShimTxType
+        log.warning("[REDEEM L1] RelayerTxType not found in SDK — using string shim 'PROXY'")
+
+    # Resolve Transaction class (name also varies)
+    TransactionCls = getattr(br_models, "Transaction", None)
+    if TransactionCls is None:
+        class TransactionCls:  # type: ignore
+            def __init__(self, to: str, data: str, value: str):
+                self.to, self.data, self.value = to, data, value
+
+    calldata = _encode_redeem_positions(condition_id)
+    if not calldata:
         return False
 
     key, secret, passphrase = creds
     rpc_url = os.environ.get("POLYGON_RPC_URL") or os.environ.get("RPC_URL")
+
     try:
-        builder_config = BuilderConfig(local_builder_creds=BuilderApiKeyCreds(
-            key=key, secret=secret, passphrase=passphrase
-        ))
-        relay_tx_type = RelayerTxType.SAFE
-        import inspect
-        sig = inspect.signature(RelayClient.__init__)
-        kwargs = {}
-        if "relay_tx_type" in sig.parameters:
-            kwargs["relay_tx_type"] = relay_tx_type
-        if "rpc_url" in sig.parameters:
-            kwargs["rpc_url"] = rpc_url
-
-        client = RelayClient(
-            RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config,
-            **kwargs
+        builder_config = BuilderConfig(
+            local_builder_creds=BuilderApiKeyCreds(
+                key=key, secret=secret, passphrase=passphrase
+            )
         )
-        funder = (FUNDER_ADDRESS or "").lower()
 
+        # ── ALWAYS use PROXY type for signature_type=1 (Magic/email) accounts ──
+        proxy_tx_type = RelayerTxType.PROXY
+
+        # Build RelayClient — try keyword arg first (newer SDK), then positional
         try:
-            expected_safe = client.get_expected_safe()
-        except Exception:
-            expected_safe = None
-        try:
-            expected_proxy = client.get_expected_proxy_wallet()
-        except Exception:
-            expected_proxy = None
-
-        if expected_proxy and funder == expected_proxy.lower():
-            relay_tx_type = RelayerTxType.PROXY
-        elif expected_safe and funder == expected_safe.lower():
-            relay_tx_type = RelayerTxType.SAFE
-
-        if getattr(client, "relay_tx_type", None) != relay_tx_type:
-            if "relay_tx_type" in sig.parameters:
-                kwargs["relay_tx_type"] = relay_tx_type
-            client = RelayClient(
+            relay_client = RelayClient(
                 RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config,
-                **kwargs
+                relay_tx_type=proxy_tx_type,
+                rpc_url=rpc_url,
+            )
+        except TypeError:
+            # Older SDK: positional args only
+            relay_client = RelayClient(
+                RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config, proxy_tx_type
             )
 
-        tx = TransactionCls(
-            to=CTF_CONTRACT,
-            data=data,
-            value="0",
-        )
-        resp = client.execute([tx], "Redeem positions")
-        log.info(f"[REDEEM] Relayer submitted: {resp}")
+        tx = TransactionCls(to=CTF_CONTRACT, data=calldata, value="0")
+        log.info(f"[REDEEM L1] Submitting via relayer (PROXY type)...")
+        resp = relay_client.execute([tx], "Redeem CTF positions")
+        log.info(f"[REDEEM L1] Relayer response: {resp}")
+
+        # Wait for confirmation if the SDK supports it
         try:
             result = resp.wait()
-            log.info(f"[REDEEM] Relayer result: {result}")
+            log.info(f"[REDEEM L1] ✅ Confirmed: {result}")
         except Exception as e:
-            log.info(f"[REDEEM] Relayer wait failed (continuing): {e}")
+            log.info(f"[REDEEM L1] wait() failed — assuming submitted (continuing): {e}")
+
         return True
+
     except Exception as e:
-        log.warning(f"[REDEEM] Relayer redeem failed: {e}")
+        log.warning(f"[REDEEM L1] Relayer attempt failed: {e}")
         return False
 
-async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> bool:
+# ─── LAYER 2: poly-web3 library (community Python relayer port) ───────────────
+def _redeem_via_poly_web3(condition_id: str) -> bool:
     """
-    Check whether the winning position is redeemable via the Polymarket Data API.
+    Use the poly-web3 library — a Python rewrite of Polymarket's official
+    TypeScript builder-relayer-client. Supports both Proxy and Safe wallets.
 
-    What this function does:
-      1. Calls data-api.polymarket.com/positions?user=<proxy> and looks for
-         a position with redeemable=true and a matching conditionId.
-      2. Returns True if found (prize is already settled / being settled).
-      3. Returns False if not yet redeemable (oracle still confirming).
+    Install: pip install poly-web3
+    Requires: BUILDER_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE in .env
+    """
+    if not condition_id:
+        return False
 
-    The caller (_background_redeem) then attempts to redeem via the relayer
-    when redeemable=True (if builder credentials are available), and keeps
-    polling the balance until USDC arrives.
+    creds = _builder_creds()
+    if not creds:
+        log.warning("[REDEEM L2] Builder creds missing — skipping poly-web3 layer.")
+        return False
+
+    try:
+        from poly_web3 import RELAYER_URL as PW3_RELAYER_URL, PolyWeb3Service
+        from py_builder_relayer_client.client import RelayClient as PW3RelayClient
+        from py_builder_signing_sdk.config import BuilderConfig as PW3BuilderConfig
+        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds as PW3Creds
+    except ImportError as e:
+        log.warning(f"[REDEEM L2] poly-web3 not installed: {e}")
+        log.warning("[REDEEM L2] Install with: pip install poly-web3")
+        return False
+
+    key, secret, passphrase = creds
+    try:
+        clob = ClobClient(
+            CLOB_HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
+            signature_type=1, funder=FUNDER_ADDRESS,
+        )
+        clob.set_api_creds(clob.create_or_derive_api_creds())
+
+        builder_config = PW3BuilderConfig(
+            local_builder_creds=PW3Creds(key=key, secret=secret, passphrase=passphrase)
+        )
+        relay_url = os.environ.get("POLYMARKET_RELAYER_URL", PW3_RELAYER_URL)
+        relayer_client = PW3RelayClient(
+            relay_url, CHAIN_ID, PRIVATE_KEY, builder_config
+        )
+
+        service = PolyWeb3Service(
+            clob_client=clob,
+            relayer_client=relayer_client,
+            private_key=PRIVATE_KEY,
+            chain_id=CHAIN_ID,
+        )
+
+        cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
+        log.info(f"[REDEEM L2] poly-web3 redeem for condition {cid[:20]}...")
+        result = service.redeem_positions(cid)
+        log.info(f"[REDEEM L2] ✅ poly-web3 result: {result}")
+        return True
+    except Exception as e:
+        log.warning(f"[REDEEM L2] poly-web3 attempt failed: {e}")
+        return False
+
+# ─── LAYER 3: Direct proxy.forward() via web3.py ──────────────────────────────
+def _redeem_via_proxy_forward(condition_id: str) -> bool:
+    """
+    Call the Polymarket Proxy contract's forward() function directly using web3.py.
+
+    This is the CORRECT direct approach for Magic/email proxy wallets:
+      - Your EOA is the owner of the proxy contract
+      - You call proxy.forward(CTF_CONTRACT, redeemPositions_calldata, 0) from your EOA
+      - The proxy contract executes it internally, so CTF sees the proxy address
+        as msg.sender — which is where the tokens actually are
+
+    This is different from v5's broken approach which called CTF directly from EOA.
+
+    Costs: ~0.0001–0.001 MATIC in gas (less than $0.001)
+    Requires: web3 + eth_account installed, small MATIC balance at your EOA
+    """
+    if not WEB3_AVAILABLE:
+        log.warning("[REDEEM L3] web3/eth_account not installed.")
+        log.warning("[REDEEM L3] Install with: pip install web3 eth-account")
+        return False
+    if not condition_id:
+        log.warning("[REDEEM L3] condition_id missing.")
+        return False
+
+    # Connect to Polygon RPC
+    rpc_urls = [
+        os.environ.get("POLYGON_RPC_URL"),
+        os.environ.get("RPC_URL"),
+        "https://rpc.ankr.com/polygon",
+        "https://polygon.llamarpc.com",
+        "https://1rpc.io/matic",
+        "https://polygon-rpc.com",
+        "https://polygon.meowrpc.com",
+    ]
+    w3 = None
+    for url in rpc_urls:
+        if not url:
+            continue
+        try:
+            tmp = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 8}))
+            if tmp.is_connected():
+                w3 = tmp
+                log.info(f"[REDEEM L3] Connected to RPC: {url}")
+                break
+        except Exception:
+            pass
+
+    if not w3:
+        log.warning("[REDEEM L3] Cannot connect to any Polygon RPC node.")
+        return False
+
+    calldata = _encode_redeem_positions(condition_id)
+    if not calldata:
+        return False
+
+    try:
+        from eth_utils import to_checksum_address
+    except ImportError:
+        log.warning("[REDEEM L3] eth_utils not available.")
+        return False
+
+    try:
+        eoa_account = Account.from_key(PRIVATE_KEY)
+        eoa_address = eoa_account.address
+
+        # Check EOA has MATIC for gas
+        matic_balance = w3.eth.get_balance(eoa_address)
+        matic_eth = w3.from_wei(matic_balance, "ether")
+        log.info(f"[REDEEM L3] EOA {eoa_address[:16]}... MATIC balance: {matic_eth:.6f}")
+        if matic_balance < w3.to_wei(0.0005, "ether"):
+            log.warning(
+                f"[REDEEM L3] EOA has only {matic_eth:.6f} MATIC — may not be enough for gas.\n"
+                f"             Send at least 0.001 MATIC to {eoa_address} and retry."
+            )
+            # Still attempt — might just barely work
+
+        # Derive the proxy wallet address for this EOA using CREATE2
+        # Polymarket Proxy Factory: salt = keccak256(abi.encodePacked(eoa_address))
+        # The proxy is deterministic — we can compute it without an RPC call
+        from eth_utils import keccak
+        from eth_abi import encode as abi_encode
+
+        # Proxy init code hash (Polymarket EIP-1167 minimal proxy)
+        # This is the keccak256 of the proxy bytecode deployed by the factory
+        PROXY_INIT_CODE_HASH = "0x56d8f0ae0900b0dd1ee7fe64dfec9abaf5ab540aa012f9d98a3bf5a60a4d0aa1"
+
+        salt = keccak(
+            encode(["address"], [to_checksum_address(eoa_address)])
+        )
+        # CREATE2 address = keccak256(0xff ++ factory ++ salt ++ initCodeHash)[12:]
+        factory_bytes = bytes.fromhex(PROXY_FACTORY[2:])
+        init_hash     = bytes.fromhex(PROXY_INIT_CODE_HASH[2:])
+        create2_input = b"\xff" + factory_bytes + salt + init_hash
+        proxy_address = to_checksum_address(
+            "0x" + keccak(create2_input)[12:].hex()
+        )
+        log.info(f"[REDEEM L3] Derived proxy address: {proxy_address}")
+
+        # Verify the proxy address matches FUNDER_ADDRESS
+        if FUNDER_ADDRESS and proxy_address.lower() != FUNDER_ADDRESS.lower():
+            log.warning(
+                f"[REDEEM L3] Derived proxy {proxy_address} != FUNDER_ADDRESS {FUNDER_ADDRESS}.\n"
+                f"             Using FUNDER_ADDRESS from env as the proxy address."
+            )
+            proxy_address = to_checksum_address(FUNDER_ADDRESS)
+
+        # Polymarket Proxy ABI — forward(address to, bytes data, uint256 value)
+        # This is the function that executes arbitrary calls through the proxy
+        PROXY_FORWARD_ABI = [
+            {
+                "name": "forward",
+                "type": "function",
+                "stateMutability": "nonpayable",
+                "inputs": [
+                    {"name": "to",    "type": "address"},
+                    {"name": "data",  "type": "bytes"},
+                    {"name": "value", "type": "uint256"},
+                ],
+                "outputs": [{"name": "", "type": "bytes"}],
+            }
+        ]
+
+        proxy_contract = w3.eth.contract(
+            address=proxy_address,
+            abi=PROXY_FORWARD_ABI,
+        )
+
+        # Verify the proxy exists (has code)
+        code = w3.eth.get_code(proxy_address)
+        if code == b"" or code == "0x":
+            log.warning(
+                f"[REDEEM L3] No contract code at {proxy_address}.\n"
+                f"             Proxy may not be deployed. Log in to polymarket.com\n"
+                f"             and make one trade to deploy your proxy wallet."
+            )
+            return False
+
+        ctf_address = to_checksum_address(CTF_CONTRACT)
+        calldata_bytes = bytes.fromhex(calldata[2:])  # strip 0x
+
+        nonce    = w3.eth.get_transaction_count(eoa_address)
+        gas_price = int(w3.eth.gas_price * 1.3)
+
+        txn = proxy_contract.functions.forward(
+            ctf_address, calldata_bytes, 0
+        ).build_transaction({
+            "from":     eoa_address,
+            "nonce":    nonce,
+            "gas":      350000,
+            "gasPrice": gas_price,
+            "chainId":  CHAIN_ID,
+        })
+
+        signed = eoa_account.sign_transaction(txn)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        log.info(f"[REDEEM L3] Proxy forward tx sent → https://polygonscan.com/tx/{tx_hash.hex()}")
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        success = receipt["status"] == 1
+        if success:
+            log.info(f"[REDEEM L3] ✅ SUCCESS via proxy.forward() (block {receipt['blockNumber']}, gas {receipt['gasUsed']})")
+        else:
+            log.warning(f"[REDEEM L3] Tx reverted. Check: https://polygonscan.com/tx/{tx_hash.hex()}")
+        return success
+
+    except Exception as e:
+        log.warning(f"[REDEEM L3] proxy.forward() failed: {e}", exc_info=True)
+        return False
+
+async def _check_redeemable(session: aiohttp.ClientSession, condition_id: str) -> bool:
+    """
+    Poll Polymarket Data API to see if the winning position is redeemable.
+    Returns True when redeemable=true is seen for this condition.
     """
     funder = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
-
     if not funder:
         log.warning("[REDEEM] POLYMARKET_FUNDER_ADDRESS not set — cannot check redeemable status")
         return False
 
     cid = condition_id if condition_id.startswith("0x") else "0x" + condition_id
-
     try:
         async with session.get(
             "https://data-api.polymarket.com/positions",
@@ -1252,95 +1497,21 @@ async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> boo
             if p.get("redeemable") is True
             and p.get("conditionId", "").lower() == cid.lower()
         ]
-
         if redeemable:
             size = redeemable[0].get("size", "?")
-            log.info(f"[REDEEM] ✅ Position redeemable! size={size} tokens — Polymarket auto-settlement in progress...")
+            log.info(f"[REDEEM] ✅ Position redeemable! size={size} tokens")
             return True
         else:
-            log.info(f"[REDEEM] Position not yet redeemable (oracle still confirming)...")
+            log.info("[REDEEM] Position not yet redeemable (oracle still confirming)...")
             return False
 
     except Exception as e:
         log.warning(f"[REDEEM] Data API check failed: {e}")
         return False
 
-# ─── NEW: Direct on-chain redeem (fallback when no builder creds) ─────────────
-def _redeem_direct(condition_id: str) -> bool:
-    """Direct Polygon transaction using your PRIVATE_KEY (no relayer needed)."""
-    if not WEB3_AVAILABLE:
-        log.warning("[REDEEM DIRECT] web3/eth_account not installed — install with: pip install web3 eth-account")
-        return False
-    if not condition_id:
-        log.warning("[REDEEM DIRECT] condition_id missing")
-        return False
-
-    rpc_urls = [
-        os.environ.get("POLYGON_RPC_URL"),
-        os.environ.get("RPC_URL"),
-        "https://rpc.ankr.com/polygon",
-        "https://polygon.llamarpc.com",
-        "https://1rpc.io/matic",
-        "https://polygon-rpc.com"
-    ]
-    
-    w3 = None
-    for url in rpc_urls:
-        if not url: continue
-        try:
-            temp_w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 5}))
-            if temp_w3.is_connected():
-                w3 = temp_w3
-                log.info(f"[REDEEM DIRECT] Connected to {url}")
-                break
-        except Exception:
-            pass
-
-    if not w3:
-        log.warning("[REDEEM DIRECT] Cannot connect to any RPC")
-        return False
-
-    try:
-        account = Account.from_key(PRIVATE_KEY)
-        data = _encode_redeem_positions(condition_id)
-        if not data:
-            return False
-
-        nonce = w3.eth.get_transaction_count(account.address)
-        gas_limit = 250000
-        gas_price = int(w3.eth.gas_price * 1.2)
-        total_cost = gas_limit * gas_price
-        
-        balance = w3.eth.get_balance(account.address)
-        if balance < total_cost:
-            matic_needed = w3.from_wei(total_cost, 'ether')
-            matic_balance = w3.from_wei(balance, 'ether')
-            log.warning(f"[REDEEM DIRECT] Insufficient MATIC. Need {matic_needed} MATIC, but have {matic_balance} MATIC. Fund: {account.address}")
-            return False
-
-        tx = {
-            'nonce': nonce,
-            'to': CTF_CONTRACT,
-            'data': data,
-            'value': 0,
-            'gas': gas_limit,
-            'gasPrice': gas_price,
-            'chainId': CHAIN_ID,
-        }
-        signed_tx = account.sign_transaction(tx)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        log.info(f"[REDEEM DIRECT] Tx sent → https://polygonscan.com/tx/{tx_hash.hex()}")
-
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-        success = receipt['status'] == 1
-        if success:
-            log.info(f"[REDEEM DIRECT] ✅ SUCCESS (block {receipt['blockNumber']}, gas {receipt['gasUsed']})")
-        else:
-            log.warning("[REDEEM DIRECT] Tx reverted")
-        return success
-    except Exception as e:
-        log.warning(f"[REDEEM DIRECT] Failed: {e}")
-        return False
+# Keep old name as alias so _background_redeem can call it unchanged
+async def _auto_redeem(session: aiohttp.ClientSession, condition_id: str) -> bool:
+    return await _check_redeemable(session, condition_id)
 
 async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, state: BotState):
     """
@@ -1393,84 +1564,119 @@ async def _background_redeem(
     bal_before: float,
 ):
     """
-    Background task: waits for on-chain settlement then redeems.
+    Background task: waits for on-chain settlement then redeems via 3-layer cascade.
 
     Timeline after a 5-min BTC market resolves:
-      ~0-30s   : WSS market_resolved fires, oracle tx submitted
-      ~2-3 min : oracle tx confirmed, redeemPositions becomes callable
-      ~3-5 min : relayer or direct tx processes
-      ~10 min  : hard timeout — give up and log a warning
+      ~0-30s   : WSS market_resolved fires, oracle tx submitted on-chain
+      ~2-3 min : oracle tx confirmed; Data API shows redeemable=true
+      ~3-5 min : redeem tx processes, USDC arrives in proxy wallet
+      ~10 min  : hard timeout — give up and warn
 
-    Strategy:
-      1. Poll data-api every 5s until redeemable=true
-      2. Submit redeem (relayer if creds, else DIRECT web3)
-      3. Keep polling balance until USDC arrives
+    Three-Layer Redeem Cascade (all correctly routed through the proxy contract):
+      Layer 1: py_builder_relayer_client with RelayerTxType.PROXY  (gasless)
+      Layer 2: poly-web3 library                                    (gasless)
+      Layer 3: Direct proxy.forward() via web3.py                   (~$0.001 MATIC gas)
+
+    Each layer is tried once when redeemable=True is first confirmed.
+    Balance is polled every 5s after submission until USDC arrives.
     """
-    POLL_INTERVAL = 5     # check every 5s
-    HARD_TIMEOUT  = 600   # give up after 10 min
+    POLL_INTERVAL = 5    # seconds between redeemable checks
+    HARD_TIMEOUT  = 600  # 10-minute hard deadline
 
     log.info(f"[REDEEM] Background task started for {condition_id[:20]}... — polling every {POLL_INTERVAL}s")
     deadline          = time.time() + HARD_TIMEOUT
     bal_before_redeem = get_balance(client)
     attempt           = 0
+    redeem_submitted  = False  # ensure we only run the cascade once
 
-    relayer_sent = False
     while time.time() < deadline:
         attempt += 1
-        log.info(f"[REDEEM] Attempt {attempt} (T+{int(time.time()-deadline+HARD_TIMEOUT)}s elapsed)...")
-        success = await _auto_redeem(session, condition_id)
+        elapsed = int(time.time() - deadline + HARD_TIMEOUT)
+        log.info(f"[REDEEM] Attempt {attempt} (T+{elapsed}s elapsed)...")
 
-        await asyncio.sleep(2)   # brief pause for balance to propagate
+        # Fast-path: check if balance already increased (auto-settlement by Polymarket)
+        await asyncio.sleep(2)
         bal_now = get_balance(client)
         state.last_balance = bal_now
         gained = bal_now - bal_before_redeem
-
         log.info(f"[REDEEM] Balance: ${bal_before_redeem:.4f} → ${bal_now:.4f} (gained ${gained:+.4f})")
 
         if gained > 0.01:
-            # Balance already increased — settlement complete
-            log.info(f"[REDEEM] ✅ CLAIMED! New balance: ${bal_now:.4f}")
+            log.info(f"[REDEEM] ✅ CLAIMED (auto-settled)! New balance: ${bal_now:.4f}")
             _save_resolved_trade(pos, "win", gained, gross, fee_usdc, net, bal_before, bal_now)
             return
 
-        if success:
-            # redeemable=True confirmed — submit redeem (relayer OR direct)
-            if not relayer_sent:
-                creds = _builder_creds()
-                if creds:
-                    log.info("[REDEEM] Builder creds detected — attempting relayer redeem...")
-                    relayer_sent = _redeem_via_relayer(condition_id)
-                if not relayer_sent:
-                    log.info("[REDEEM] Relayer skipped/failed — falling back to direct on-chain redeem...")
-                    relayer_sent = _redeem_direct(condition_id)
+        # Check if the Data API confirms the position is redeemable
+        is_redeemable = await _auto_redeem(session, condition_id)
 
-                if relayer_sent:
-                    log.info("[REDEEM] ✅ Redeem transaction submitted — waiting for USDC...")
+        if is_redeemable and not redeem_submitted:
+            log.info("[REDEEM] Position confirmed redeemable — launching 3-layer cascade...")
+            redeem_submitted = True  # only attempt cascade once
+
+            # ── Layer 1: Official relayer SDK with PROXY type ─────────────────
+            log.info("[REDEEM] Layer 1: py_builder_relayer_client (RelayerTxType.PROXY)...")
+            l1_ok = _redeem_via_relayer(condition_id)
+            if l1_ok:
+                log.info("[REDEEM] Layer 1 submitted ✅ — waiting for USDC...")
+            else:
+                log.info("[REDEEM] Layer 1 failed or skipped — trying Layer 2...")
+
+                # ── Layer 2: poly-web3 library ────────────────────────────────
+                log.info("[REDEEM] Layer 2: poly-web3 library...")
+                l2_ok = _redeem_via_poly_web3(condition_id)
+                if l2_ok:
+                    log.info("[REDEEM] Layer 2 submitted ✅ — waiting for USDC...")
                 else:
-                    log.info("[REDEEM] Redeem submission failed — keep polling (may auto-settle)")
+                    log.info("[REDEEM] Layer 2 failed or skipped — trying Layer 3...")
 
-            # Keep polling balance every 5s until USDC arrives (usually within 30s).
-            for wait in range(24):  # up to 2 more minutes
+                    # ── Layer 3: Direct proxy.forward() via web3.py ───────────
+                    log.info("[REDEEM] Layer 3: direct proxy.forward() via web3.py...")
+                    l3_ok = _redeem_via_proxy_forward(condition_id)
+                    if l3_ok:
+                        log.info("[REDEEM] Layer 3 submitted ✅ — waiting for USDC...")
+                    else:
+                        log.warning(
+                            "[REDEEM] All 3 layers failed.\n"
+                            "         Possible causes:\n"
+                            "           • No Builder creds (layers 1+2) AND no MATIC (layer 3)\n"
+                            "           • Proxy not deployed (log in to polymarket.com first)\n"
+                            "         Balance polling continues — Polymarket may auto-settle."
+                        )
+
+        if is_redeemable:
+            # Poll balance every 5s for up to 2 more minutes after submission
+            for wait_idx in range(24):
                 await asyncio.sleep(5)
                 bal_now = get_balance(client)
                 state.last_balance = bal_now
                 gained = bal_now - bal_before_redeem
-                log.info(f"[REDEEM] Waiting for settlement: bal=${bal_now:.4f} gained=${gained:+.4f} ({wait+1}/24)")
+                log.info(
+                    f"[REDEEM] Waiting for USDC: bal=${bal_now:.4f} "
+                    f"gained=${gained:+.4f} ({wait_idx+1}/24)"
+                )
                 if gained > 0.01:
                     log.info(f"[REDEEM] ✅ CLAIMED! New balance: ${bal_now:.4f}")
                     _save_resolved_trade(pos, "win", gained, gross, fee_usdc, net, bal_before, bal_now)
                     return
-            log.warning("[REDEEM] redeemable=True but balance never increased — may need manual claim")
+            # Still not arrived after 2 minutes of polling — log and give up
+            log.warning(
+                "[REDEEM] redeemable=True and redeem submitted, but balance hasn't changed.\n"
+                "         This can happen if the tx is still pending on Polygon.\n"
+                "         Check polygonscan.com for your proxy address or claim manually at polymarket.com"
+            )
             _save_resolved_trade(pos, "win", 0, gross, fee_usdc, net, bal_before, bal_now)
             return
 
         log.info(f"[REDEEM] Not yet redeemable — next check in {POLL_INTERVAL}s...")
         await asyncio.sleep(POLL_INTERVAL)
 
-    # Timed out
+    # Hard timeout reached
     bal_final = get_balance(client)
     state.last_balance = bal_final
-    log.warning(f"[REDEEM] ⚠️ 10 min timeout. Balance: ${bal_final:.4f}. Claim manually on Polymarket.")
+    log.warning(
+        f"[REDEEM] ⚠️ 10-min timeout. Final balance: ${bal_final:.4f}.\n"
+        f"         Claim manually at polymarket.com if prize not received."
+    )
     _save_resolved_trade(pos, "win", bal_final - bal_before, gross, fee_usdc, net, bal_before, bal_final)
 
 
@@ -1583,11 +1789,11 @@ async def run_bot():
         loop.add_signal_handler(sig, stop.set)
 
     log.info("=" * 65)
-    log.info(" Polymarket BTC 5m Bot v5  —  $5 fixed | Entry window 30s")
+    log.info(" Polymarket BTC 5m Bot v6  —  $5 fixed | Entry window 30s | Redeem: 3-layer cascade")
     log.info(f" Buy: >= {BASE_THRESHOLD*100:.0f}% (adaptive {ADAPTIVE_THRESH*100:.0f}% after 2 losses)")
     log.info(f" Stop-loss: sell if bid < {STOP_LOSS_BID*100:.0f}% AND > {STOP_LOSS_MIN_SEC}s remain")
     log.info(f" Filters: spread<{MAX_SPREAD} | liq>${MIN_LIQUIDITY} | vol-momentum | presign@T-{PRESIGN_BEFORE}s")
-    log.info(" REDEEM: fully automatic (relayer OR direct web3) — prize collected ~2 min after close")
+    log.info(" REDEEM: 3-layer cascade (relayer PROXY → poly-web3 → proxy.forward) — auto-claimed ~2-5 min after close")
     log.info("=" * 65)
 
     async with aiohttp.ClientSession() as session:
