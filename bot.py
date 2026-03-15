@@ -1116,6 +1116,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
     """
     attempt = 0
     deadline = time.time() + max(time_left - MIN_FIRE_BUFFER, 2)
+    last_order_status = ""   # track final accepted status to skip cancel on matched orders
 
     while time.time() < deadline:
         attempt += 1
@@ -1145,6 +1146,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
 
             if status in ("live", "matched", "filled") or size_matched > 0:
                 log.info(f"  ✅ Order accepted on attempt {attempt} (status={status}) — stopping retries")
+                last_order_status = status
                 break  # Order is in the book or filled — do NOT retry
 
             # Rate limit: 1s between retries (well under Polymarket's 10 req/s limit)
@@ -1167,23 +1169,23 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
         continue
 
     # ── Post-loop fill detection ──────────────────────────────────────────────
-    # When the order lands as "live" (resting GTC), the balance won't have
-    # changed yet.  Poll for up to ~25s so a passive fill is detected before
-    # we give up and call it unmatched.  This is what caused the "$4.73
-    # disappeared" bug: the order filled passively after the bot declared
-    # "unmatched", leaving an untracked open position with no stop-loss or
-    # resolution handler.
-    MAX_FILL_WAIT = 25          # seconds to poll after a live order
+    # When the order lands as "live" or "matched" (resting GTC), the balance
+    # won't have changed yet.  Poll for up to ~25s so a passive fill is detected
+    # before we give up and call it unmatched.
+    #
+    # CRITICAL FIX: status="matched" means Polymarket accepted and matched the
+    # order — it IS filled even when size_matched=0.0 (a known API quirk where
+    # the size_matched field is not populated in the initial response).
+    # We MUST NOT cancel or declare unmatched in this case.
+    # We also do NOT stop polling early because now_left <= MIN_FIRE_BUFFER —
+    # the market closing does not prevent us detecting the balance delta.
+    MAX_FILL_WAIT = 40          # seconds to poll — long enough to span market close + settle
     poll_interval = 2
     elapsed = 0
     while elapsed < MAX_FILL_WAIT:
         bal_after_attempt = get_balance(client)
         filled_amount = bal_before - bal_after_attempt
         if filled_amount > 0.01:
-            break
-        # Also stop polling if market has essentially closed
-        now_left = state.market.end_ts - int(time.time() + state.clock_offset)
-        if now_left <= MIN_FIRE_BUFFER:
             break
         await asyncio.sleep(poll_interval)
         elapsed += poll_interval
@@ -1211,12 +1213,40 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
         ))
         return
 
-    # Order never filled — cancel it so it doesn't fill after we advance
-    try:
-        client.cancel_all()
-        log.info("  Cancelled unfilled GTC order.")
-    except Exception:
-        pass
+    # Order never filled — cancel it so it doesn't fill after we advance.
+    # IMPORTANT: Do NOT cancel if the order was accepted (matched/live/filled) —
+    # it has already filled or is in the book and the balance poll above just
+    # didn't catch it in time.  Cancelling it would waste the fill.
+    if last_order_status not in ("matched", "live", "filled"):
+        try:
+            client.cancel_all()
+            log.info("  Cancelled unfilled GTC order.")
+        except Exception:
+            pass
+    else:
+        log.info(f"  Order was accepted (status={last_order_status}) — skipping cancel, "
+                 f"balance poll did not confirm fill in time.")
+        # Even though balance poll timed out, the order DID match — treat as filled
+        # using the expected spend amount so the position is tracked and redeemed.
+        shares = round(STAKE / price, 6)
+        bal_after_attempt = get_balance(client)
+        log.warning(f"  ⚠️ FORCE-SETTING position from accepted order: "
+                    f"shares={shares:.6f} @ {price:.4f} | bal_before=${bal_before:.4f} bal_now=${bal_after_attempt:.4f}")
+        state.position = Position(
+            side=side, token_id=token_id, entry_price=price,
+            shares=shares, cycle_id=_cycle_id(),
+            market=state.market,
+        )
+        state.last_balance = bal_after_attempt
+        save_trade(TradeRecord(
+            cycle_id=state.position.cycle_id, side=side,
+            entry_price=price, exit_price=0,
+            shares_held=shares, stake=STAKE, outcome="open",
+            payout=0, gross_profit=0, fee_usdc=0, net_profit=0,
+            balance_before=bal_before, balance_after=bal_after_attempt,
+            market_slug=state.market.slug, timestamp=_ts(),
+        ))
+        return
 
     log.info(f"Buy unmatched after {attempt} attempt(s) — no fill.")
     save_trade(TradeRecord(
@@ -1971,6 +2001,9 @@ async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, st
     except Exception as e:
         log.warning(f"[ADVANCE] Cancel orders: {e}")
 
+    # Scan for any redeemable orphan positions we may have missed this cycle
+    asyncio.create_task(_scan_and_redeem_orphans(session, client, state))
+
     try:
         server_ts = int(await asyncio.to_thread(client.get_server_time))
     except Exception:
@@ -2014,6 +2047,59 @@ async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, st
 def _ts(): return datetime.utcnow().isoformat() + "Z"
 def _cycle_id(): return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:00Z")
 
+async def _scan_and_redeem_orphans(session: aiohttp.ClientSession, client: ClobClient, state: BotState):
+    """
+    Scan the Data API for any redeemable positions that the bot may have missed
+    (e.g. due to the status=matched / balance-poll-timeout bug).
+    Called at startup and after each market advance.
+    Fires a background redeem task for every redeemable position found.
+    """
+    funder = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
+    if not funder:
+        return
+    try:
+        async with session.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": funder.lower(), "sizeThreshold": "0.01"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            positions = await r.json() if r.status == 200 else []
+
+        if not isinstance(positions, list):
+            return
+
+        redeemable = [p for p in positions if p.get("redeemable") is True]
+        if not redeemable:
+            log.info("[ORPHAN-SCAN] No redeemable orphan positions found.")
+            return
+
+        for p in redeemable:
+            cid  = p.get("conditionId", "")
+            size = p.get("size", "?")
+            if not cid:
+                continue
+            log.warning(f"[ORPHAN-SCAN] ⚠️ Found unredeemed position! "
+                        f"conditionId={cid[:20]}... size={size} — launching redeem task")
+            # Build a minimal stub Position so _background_redeem can log/save correctly
+            stub_market = state.market or Market(
+                slug="orphan", end_ts=0,
+                up_token_id="", down_token_id="", condition_id=cid,
+            )
+            stub_market.condition_id = cid
+            stub_pos = Position(
+                token_id="", side="unknown",
+                entry_price=0.0, shares=float(size) if isinstance(size, (int, float)) else 0.0,
+                cycle_id=_cycle_id(), market=stub_market,
+            )
+            asyncio.create_task(
+                _background_redeem(session, client, state, cid, stub_pos,
+                                   gross=0.0, fee_usdc=0.0, net=0.0,
+                                   bal_before=state.last_balance)
+            )
+
+    except Exception as e:
+        log.warning(f"[ORPHAN-SCAN] scan failed: {e}")
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 async def run_bot():
     assert PRIVATE_KEY and "YOUR" not in PRIVATE_KEY,    "Set POLYMARKET_PRIVATE_KEY in .env"
@@ -2047,6 +2133,9 @@ async def run_bot():
         log.info(f"USDC balance: ${state.last_balance:.4f}")
         if state.last_balance < STAKE:
             log.warning(f"Balance shows ${state.last_balance:.4f} — if funded, SDK may be misreading. Continuing...")
+
+        # Scan for any redeemable positions missed by previous runs (e.g. status=matched bug)
+        await _scan_and_redeem_orphans(session, client, state)
 
         # Bootstrap first market
         m = await fetch_btc_market(session, server_ts)
