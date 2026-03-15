@@ -539,8 +539,7 @@ def get_signal(market: Market, history: deque, consecutive_losses: int,
     late_entry = time_left < LATE_ENTRY_MAX_T
     effective_threshold = min(threshold + LATE_ENTRY_SURCHARGE, 1.00) if late_entry else threshold
     if late_entry:
-        log.info(f"  Late-entry tightening: T-{time_left}s < {LATE_ENTRY_MAX_T}s — "
-                 f"threshold raised {threshold:.2f} -> {effective_threshold:.2f}")
+        log.debug(f"  Late-entry tightening: T-{time_left}s — threshold {threshold:.2f} -> {effective_threshold:.2f}")
 
     for token_id, side_label in [
         (market.up_token_id,   "up"),
