@@ -4,3 +4,4 @@ websockets>=12.0
 python-dotenv>=1.0.0
 py-builder-relayer-client>=0.0.1
 poly-web3>=0.1.0
+eth-account
