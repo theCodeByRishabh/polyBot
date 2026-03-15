@@ -88,13 +88,13 @@ RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RE
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
 STAKE             = 6.00    # Fixed $5.00 per trade (min 5 shares at 0.93+ price)
-BASE_THRESHOLD    = 0.93    # Buy when dominant side ask >= 93%
-ADAPTIVE_THRESH   = 0.97    # Raised after 2 consecutive losses
+BASE_THRESHOLD    = 0.94    # Buy when dominant side ask >= 93%
+ADAPTIVE_THRESH   = 0.98    # Raised after 2 consecutive losses
 ENTRY_WINDOW_SEC  = 30      # Enter any time price >= threshold AND <=30s remain
 PRESIGN_BEFORE    = 40      # Build signed order at T-40s (removes signing latency)
 MIN_FIRE_BUFFER   = 3       # Never fire if < 3s remain (too risky)
-STOP_LOSS_BID     = 0.60    # Exit position if best_bid falls below this
-STOP_LOSS_MIN_SEC = 5       # Don't stop-loss if < 5s remain (just let it resolve)
+STOP_LOSS_BID     = 0.70    # Exit position if best_bid falls below this
+STOP_LOSS_MIN_SEC = 2       # Don't stop-loss if < 5s remain (just let it resolve)
 STABILITY_N       = 5       # Price ticks needed for stability check
 MAX_STD_DEV       = 0.015   # Max std-dev for stability
 MIN_LIQUIDITY     = 3.0     # Min USDC ask depth
@@ -1146,12 +1146,8 @@ def _encode_redeem_positions(condition_id: str) -> Optional[str]:
 def _redeem_via_relayer(condition_id: str) -> bool:
     """
     Route redeemPositions through the Polymarket relayer using the PROXY tx type.
-
-    Critical v5 bug fixed here: v5 used RelayerTxType.SAFE which is for MetaMask
-    Gnosis Safe accounts. For Magic/email accounts (signature_type=1) you MUST use
-    RelayerTxType.PROXY. The relayer then wraps the call in a ProxyTransaction and
-    executes it through your proxy contract gaslessly.
-
+    Uses inspect.signature to detect the exact RelayClient constructor at runtime,
+    so this works correctly regardless of which SDK version is installed.
     Requires: BUILDER_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE in .env
     """
     if not condition_id:
@@ -1167,26 +1163,24 @@ def _redeem_via_relayer(condition_id: str) -> bool:
         from py_builder_relayer_client.client import RelayClient
         import py_builder_relayer_client.models as br_models
         from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
+        import inspect
     except ImportError as e:
-        log.warning(f"[REDEEM L1] py_builder_relayer_client not installed: {e}")
-        log.warning("[REDEEM L1] Install with: pip install py-builder-relayer-client py-builder-signing-sdk")
+        log.warning(f"[REDEEM L1] SDK not installed: {e}")
         return False
 
-    # Resolve RelayerTxType — name varies across SDK versions
+    # ── Resolve RelayerTxType (name varies by SDK version) ────────────────────
     RelayerTxType = (
         getattr(br_models, "RelayerTxType", None)
         or getattr(br_models, "RelayTxType", None)
     )
-
-    # Build a shim if the SDK version doesn't export it
     if RelayerTxType is None:
         class _ShimTxType:
             PROXY = "PROXY"
             SAFE  = "SAFE"
         RelayerTxType = _ShimTxType
-        log.warning("[REDEEM L1] RelayerTxType not found in SDK — using string shim 'PROXY'")
+        log.info("[REDEEM L1] RelayerTxType not in SDK models — using string shim")
 
-    # Resolve Transaction class (name also varies)
+    # ── Resolve Transaction class (name also varies) ───────────────────────────
     TransactionCls = getattr(br_models, "Transaction", None)
     if TransactionCls is None:
         class TransactionCls:  # type: ignore
@@ -1206,54 +1200,96 @@ def _redeem_via_relayer(condition_id: str) -> bool:
                 key=key, secret=secret, passphrase=passphrase
             )
         )
-
-        # ── ALWAYS use PROXY type for signature_type=1 (Magic/email) accounts ──
         proxy_tx_type = RelayerTxType.PROXY
 
-        # Build RelayClient — try every known SDK arg signature
-        relay_client = None
-        _rc_attempts = [
-            # newest SDK: all kwargs
-            (( RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config),
-             dict(relay_tx_type=proxy_tx_type, rpc_url=rpc_url)),
-            # newer SDK: no rpc_url
-            ((RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config),
-             dict(relay_tx_type=proxy_tx_type)),
-            # older SDK: 5 positional args
-            ((RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config, proxy_tx_type),
-             {}),
-            # minimal SDK: 3-arg version
-            ((RELAYER_URL, PRIVATE_KEY, builder_config),
-             {}),
-            # minimal SDK: 4-arg version with tx type
-            ((RELAYER_URL, PRIVATE_KEY, builder_config, proxy_tx_type),
-             {}),
-        ]
-        _rc_errors = []
-        for _args, _kwargs in _rc_attempts:
-            try:
-                relay_client = RelayClient(*_args, **_kwargs)
-                log.info(f"[REDEEM L1] RelayClient created (args={len(_args)}, kwargs={list(_kwargs.keys())})")
-                break
-            except TypeError as _te:
-                _rc_errors.append(str(_te))
-        if relay_client is None:
-            log.warning("[REDEEM L1] Could not instantiate RelayClient — tried all known signatures:")
-            for _e in _rc_errors:
-                log.warning(f"[REDEEM L1]   → {_e}")
-            return False
+        # ── Introspect RelayClient.__init__ to build the right call ───────────
+        # The error "Invalid chainID: 0xecc10d3f..." means the SDK received
+        # PRIVATE_KEY where it expected chain_id — wrong positional arg order.
+        # We inspect the real parameter names to pass args correctly.
+        try:
+            rc_sig    = inspect.signature(RelayClient.__init__)
+            rc_params = [p for p in rc_sig.parameters if p != "self"]
+            log.info(f"[REDEEM L1] RelayClient params: {rc_params}")
+        except Exception:
+            rc_params = []
 
+        relay_client = None
+
+        if rc_params:
+            # Build kwargs from actual param names — no positional guessing
+            rc_kwargs = {}
+            param_map = {
+                "url":            RELAYER_URL,
+                "host":           RELAYER_URL,
+                "relayer_url":    RELAYER_URL,
+                "chain_id":       CHAIN_ID,
+                "chainId":        CHAIN_ID,
+                "private_key":    PRIVATE_KEY,
+                "key":            PRIVATE_KEY,
+                "builder_config": builder_config,
+                "config":         builder_config,
+                "relay_tx_type":  proxy_tx_type,
+                "tx_type":        proxy_tx_type,
+                "transaction_type": proxy_tx_type,
+                "rpc_url":        rpc_url,
+            }
+            for p in rc_params:
+                if p in param_map and param_map[p] is not None:
+                    rc_kwargs[p] = param_map[p]
+            try:
+                relay_client = RelayClient(**rc_kwargs)
+                log.info(f"[REDEEM L1] RelayClient created via introspection: {list(rc_kwargs.keys())}")
+            except Exception as e:
+                log.warning(f"[REDEEM L1] Introspected constructor failed: {e}")
+
+        # Fallback: brute-force every known signature if introspection failed
+        if relay_client is None:
+            _attempts = [
+                ((RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config),
+                 {"relay_tx_type": proxy_tx_type, "rpc_url": rpc_url}),
+                ((RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config),
+                 {"relay_tx_type": proxy_tx_type}),
+                ((RELAYER_URL, CHAIN_ID, PRIVATE_KEY, builder_config, proxy_tx_type), {}),
+                ((RELAYER_URL, PRIVATE_KEY, builder_config, proxy_tx_type), {}),
+                ((RELAYER_URL, PRIVATE_KEY, builder_config), {}),
+            ]
+            _errs = []
+            for _a, _k in _attempts:
+                try:
+                    relay_client = RelayClient(*_a, **_k)
+                    log.info(f"[REDEEM L1] RelayClient created (fallback args={len(_a)})")
+                    break
+                except (TypeError, Exception) as _e:
+                    _errs.append(str(_e))
+            if relay_client is None:
+                log.warning("[REDEEM L1] All RelayClient constructors failed:")
+                for _e in _errs:
+                    log.warning(f"[REDEEM L1]   → {_e}")
+                return False
+
+        # ── Set tx type post-construction if setter exists ────────────────────
+        # Some SDK versions don't accept tx_type in constructor but have a setter
+        for _setter in ("set_relay_tx_type", "set_tx_type", "set_transaction_type"):
+            _fn = getattr(relay_client, _setter, None)
+            if _fn:
+                try:
+                    _fn(proxy_tx_type)
+                    log.info(f"[REDEEM L1] Set PROXY type via {_setter}()")
+                except Exception:
+                    pass
+                break
+
+        # ── Submit the redeem transaction ─────────────────────────────────────
         tx = TransactionCls(to=CTF_CONTRACT, data=calldata, value="0")
-        log.info(f"[REDEEM L1] Submitting via relayer (PROXY type)...")
+        log.info("[REDEEM L1] Submitting via relayer (PROXY type)...")
         resp = relay_client.execute([tx], "Redeem CTF positions")
         log.info(f"[REDEEM L1] Relayer response: {resp}")
 
-        # Wait for confirmation if the SDK supports it
         try:
             result = resp.wait()
             log.info(f"[REDEEM L1] ✅ Confirmed: {result}")
         except Exception as e:
-            log.info(f"[REDEEM L1] wait() failed — assuming submitted (continuing): {e}")
+            log.info(f"[REDEEM L1] wait() skipped: {e}")
 
         return True
 
