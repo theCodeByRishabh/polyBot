@@ -1096,11 +1096,24 @@ def _redeem_via_relayer(condition_id: str) -> bool:
 
     try:
         from py_builder_relayer_client.client import RelayClient
-        from py_builder_relayer_client.models import Transaction, RelayerTxType
+        import py_builder_relayer_client.models as br_models
         from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
     except Exception as e:
         log.warning(f"[REDEEM] Relayer SDK unavailable: {e}")
         return False
+
+    RelayerTxType = getattr(br_models, "RelayerTxType", None)
+    TransactionCls = getattr(br_models, "Transaction", None)
+    if RelayerTxType is None:
+        log.warning("[REDEEM] RelayerTxType not found in relayer SDK.")
+        return False
+    if TransactionCls is None:
+        # Older SDK versions don't export Transaction; provide a minimal shim.
+        class TransactionCls:
+            def __init__(self, to: str, data: str, value: str):
+                self.to = to
+                self.data = data
+                self.value = value
 
     data = _encode_redeem_positions(condition_id)
     if not data:
@@ -1139,7 +1152,7 @@ def _redeem_via_relayer(condition_id: str) -> bool:
                 relay_tx_type=relay_tx_type, rpc_url=rpc_url
             )
 
-        tx = Transaction(
+        tx = TransactionCls(
             to=CTF_CONTRACT,
             data=data,
             value="0",
