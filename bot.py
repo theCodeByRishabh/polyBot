@@ -1133,11 +1133,14 @@ def _redeem_via_relayer(condition_id: str) -> bool:
         log.warning(f"[REDEEM] Relayer SDK unavailable: {e}")
         return False
 
-    RelayerTxType = getattr(br_models, "RelayerTxType", None)
+    RelayerTxType = getattr(br_models, "RelayerTxType", getattr(br_models, "RelayTxType", None))
     TransactionCls = getattr(br_models, "Transaction", None)
     if RelayerTxType is None:
-        log.warning("[REDEEM] RelayerTxType not found in relayer SDK.")
-        return False
+        log.warning("[REDEEM] RelayerTxType not found in relayer SDK. Using shim.")
+        class ShimRelayerTxType:
+            SAFE = "SAFE"
+            PROXY = "PROXY"
+        RelayerTxType = ShimRelayerTxType
     if TransactionCls is None:
         # Older SDK versions don't export Transaction; provide a minimal shim.
         class TransactionCls:
@@ -1262,13 +1265,32 @@ def _redeem_direct(condition_id: str) -> bool:
         log.warning("[REDEEM DIRECT] condition_id missing")
         return False
 
-    rpc_url = os.environ.get("POLYGON_RPC_URL") or os.environ.get("RPC_URL") or "https://polygon-rpc.com"
-    try:
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-        if not w3.is_connected():
-            log.warning("[REDEEM DIRECT] Cannot connect to RPC")
-            return False
+    rpc_urls = [
+        os.environ.get("POLYGON_RPC_URL"),
+        os.environ.get("RPC_URL"),
+        "https://rpc.ankr.com/polygon",
+        "https://polygon.llamarpc.com",
+        "https://1rpc.io/matic",
+        "https://polygon-rpc.com"
+    ]
+    
+    w3 = None
+    for url in rpc_urls:
+        if not url: continue
+        try:
+            temp_w3 = Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 5}))
+            if temp_w3.is_connected():
+                w3 = temp_w3
+                log.info(f"[REDEEM DIRECT] Connected to {url}")
+                break
+        except Exception:
+            pass
 
+    if not w3:
+        log.warning("[REDEEM DIRECT] Cannot connect to any RPC")
+        return False
+
+    try:
         account = Account.from_key(PRIVATE_KEY)
         data = _encode_redeem_positions(condition_id)
         if not data:
