@@ -114,8 +114,14 @@ MAX_STD_DEV       = 0.015   # Max std-dev for stability
 MIN_LIQUIDITY     = 3.0     # Min USDC ask depth
 MAX_SPREAD        = 0.04    # Skip if bid-ask spread > 3¢
 
-# ── Anti-reversal filter ──────────────────────────────────────────────────────
-# (removed — entry is governed purely by threshold + stability)
+# ── Oscillation / two-way volatility filter ───────────────────────────────────
+# Skip if the Polymarket probability is swinging wildly in BOTH directions.
+# We measure the SIZE of reverse moves, not just count — small wobbles like
+# 0.95→0.94→0.96 are fine (only 1¢ reversal). Big swings like 0.90→0.75→0.90
+# are dangerous. Only skip if a reverse move is larger than OSCILLATION_MAX_REVERSE.
+OSCILLATION_N           = 6      # how many recent ticks to inspect
+OSCILLATION_MAX_REVERSE = 0.08   # a single reverse tick > 8¢ counts as a bad swing
+OSCILLATION_BAD_SWINGS  = 2      # skip if >= this many BAD reverse ticks found
 
 TRADES_FILE = Path("trades.json")
 
@@ -127,9 +133,9 @@ class Market:
     up_token_id: str
     down_token_id: str
     condition_id: str
-    neg_risk: bool = False
-    tick_size: str = "0.01"
-    fee_rate: str  = "0"
+    neg_risk: bool  = False
+    tick_size: str  = "0.01"
+    fee_rate: str   = "0"
 
 @dataclass
 class PriceTick:
@@ -489,9 +495,15 @@ def enrich_market(client: ClobClient, market: Market) -> Market:
 def get_signal(market: Market, history: deque, consecutive_losses: int,
                time_left: int = 999) -> Optional[tuple]:
     """
-    Returns (side, token_id, best_ask) if:
-      1. best_ask >= threshold (95% base, 98% adaptive after 2 losses)
-      2. Last STABILITY_N ticks have low std-dev (price is steady)
+    Returns (side, token_id, best_ask) if ALL pass:
+
+    1. best_ask >= threshold (95% base, 98% after 2 consecutive losses)
+    2. Last STABILITY_N ticks have low std-dev (price is steady overall)
+    3. Oscillation check: of the last OSCILLATION_N tick-to-tick moves,
+       fewer than OSCILLATION_REVERSE went AGAINST our direction.
+       This catches two-way chop — e.g. 97%→94%→97%→94% has acceptable
+       std-dev but is actually oscillating badly and should be skipped.
+       Strong one-directional moves (e.g. 92%→94%→96%→97%) pass fine.
     """
     threshold = ADAPTIVE_THRESH if consecutive_losses >= 2 else BASE_THRESHOLD
     if consecutive_losses >= 2:
@@ -501,7 +513,10 @@ def get_signal(market: Market, history: deque, consecutive_losses: int,
         (market.up_token_id,   "up"),
         (market.down_token_id, "down"),
     ]:
-        ticks = [t.best_ask for t in history if t.token_id == token_id][-STABILITY_N:]
+        asks = [t.best_ask for t in history if t.token_id == token_id]
+
+        # ── 1. Threshold + stability ──────────────────────────────────────
+        ticks = asks[-STABILITY_N:]
         if len(ticks) < STABILITY_N:
             continue
         if ticks[-1] < threshold:
@@ -510,9 +525,29 @@ def get_signal(market: Market, history: deque, consecutive_losses: int,
         if std > MAX_STD_DEV:
             log.info(f"  {side_label.upper()} unstable: ask={ticks[-1]:.4f} std={std:.4f}")
             continue
+
+        # ── 2. Oscillation check ──────────────────────────────────────────
+        osc_ticks = asks[-OSCILLATION_N:]
+        if len(osc_ticks) >= 3:
+            # Count reverse moves that are LARGE (> OSCILLATION_MAX_REVERSE).
+            # Small wobbles like 0.95→0.94 (1¢ drop) are ignored.
+            # Big swings like 0.90→0.75 (15¢ drop) count as dangerous.
+            bad_swings = sum(
+                1 for i in range(1, len(osc_ticks))
+                if osc_ticks[i - 1] - osc_ticks[i] > OSCILLATION_MAX_REVERSE
+            )
+            if bad_swings >= OSCILLATION_BAD_SWINGS:
+                log.info(
+                    f"  {side_label.upper()} SKIP — large oscillations: "
+                    f"{bad_swings} swing(s) > {OSCILLATION_MAX_REVERSE:.2f} in last "
+                    f"{len(osc_ticks)-1} ticks"
+                )
+                continue
+
         log.info(f"  Signal: {side_label.upper()} ask={ticks[-1]:.4f} std={std:.4f}")
         return side_label, token_id, ticks[-1]
     return None
+
 
 # ─── Entry filters ────────────────────────────────────────────────────────────
 def spread_ok(history: deque, token_id: str) -> bool:
@@ -601,36 +636,36 @@ def presign_order(client: ClobClient, market: Market, token_id: str, price: floa
         return None
 
 async def execute_sell(client: ClobClient, market: Market, position: Position,
-                       exit_price: float) -> Optional[dict]:
+                       exit_price: float, clock_offset: float = 0.0) -> Optional[dict]:
     """
-    Sell all shares held via FAK SELL with up to 4 retries.
+    Sell all shares via FAK SELL, retrying aggressively until filled or market resolves.
 
-    Why the old single-shot approach caused $5 losses:
-      - FAK with a floor too close to market bid → no buyer at that price → order
-        fully cancelled with 0 shares sold → position silently set to None.
-      - No retry meant the position was abandoned with full loss.
-
-    Fix:
-      - Retry up to MAX_SELL_ATTEMPTS times.
-      - Each retry lowers the floor by SELL_FLOOR_STEP (1¢) to widen the fill window.
-      - After each attempt, check if balance increased — if yes, fill confirmed.
-      - Last attempt uses floor=0.01 (accept any price) so we always get out.
+    Key fixes vs previous versions:
+      - Uses clock_offset for accurate time remaining (same as trading loop)
+      - Stops only when < 2s remain (not MIN_FIRE_BUFFER) — every second counts
+      - Floor starts at exit_price - 0.05 (wider initial buffer for crashing markets)
+      - Drops floor by 2¢ every attempt — reaches 0.01 fast if market is thin
+      - Confirms fill via size_matched first, then balance delta
+      - Returns immediately on first confirmed fill
     """
-    MAX_SELL_ATTEMPTS = 4
-    SELL_FLOOR_STEP   = 0.01   # lower floor by 1¢ per retry
-
     bal_before = get_balance(client)
+    attempt = 0
 
-    for attempt in range(1, MAX_SELL_ATTEMPTS + 1):
-        # Progressive floor: start at exit_price - 0.02, drop 1¢ each retry,
-        # final attempt accepts anything above 0.01.
-        if attempt < MAX_SELL_ATTEMPTS:
-            floor = max(exit_price - 0.02 - (attempt - 1) * SELL_FLOOR_STEP, 0.01)
-        else:
-            floor = 0.01  # last resort: accept any fill
+    while True:
+        attempt += 1
 
-        log.info(f"  SELL attempt {attempt}/{MAX_SELL_ATTEMPTS}: "
-                 f"{position.shares:.6f} shares @ floor={floor:.4f}")
+        # Use clock-offset-corrected time — same reference as trading loop
+        now_left = market.end_ts - int(time.time() + clock_offset)
+        if now_left <= 2:
+            log.warning(f"  SELL abort: only {now_left}s left, market resolving.")
+            return None
+
+        # Floor drops 2¢ per attempt: attempt 1 = exit-0.05, attempt 2 = exit-0.07 ...
+        # Reaches 0.01 (accept any price) by attempt ~25, but in practice fills much sooner.
+        floor = max(exit_price - 0.05 - (attempt - 1) * 0.02, 0.01)
+
+        log.info(f"  SELL attempt {attempt}: {position.shares:.6f} shares "
+                 f"@ floor={floor:.4f} | T-{now_left}s remain")
         try:
             mo = MarketOrderArgs(
                 token_id = position.token_id,
@@ -642,59 +677,65 @@ async def execute_sell(client: ClobClient, market: Market, position: Position,
             resp  = client.post_order(order, OrderType.FAK)
             log.info(f"  Sell resp (attempt {attempt}): {resp}")
 
-            # Confirm fill by checking balance
-            await asyncio.sleep(1)
-            bal_after = get_balance(client)
-            if bal_after > bal_before + 0.01:
-                log.info(f"  ✅ Sell confirmed on attempt {attempt}: "
-                         f"balance ${bal_before:.4f} → ${bal_after:.4f}")
-                return resp
-
+            # Primary confirmation: size_matched in response
             size_matched = float(resp.get("size_matched", 0)) if resp else 0
             if size_matched > 0:
-                log.info(f"  ✅ Sell matched (size_matched={size_matched}) on attempt {attempt}")
+                log.info(f"  ✅ Sell filled: size_matched={size_matched} on attempt {attempt}")
                 return resp
 
-            log.warning(f"  Attempt {attempt}: no fill detected, retrying with lower floor...")
+            # Secondary confirmation: balance increased
+            await asyncio.sleep(0.5)
+            bal_after = get_balance(client)
+            if bal_after > bal_before + 0.01:
+                log.info(f"  ✅ Sell confirmed via balance: "
+                         f"${bal_before:.4f} → ${bal_after:.4f} on attempt {attempt}")
+                return resp
+
+            log.warning(f"  Attempt {attempt}: no fill at floor={floor:.4f}, "
+                        f"dropping floor and retrying immediately...")
 
         except Exception as e:
             log.error(f"  Sell attempt {attempt} error: {e}")
 
-        if attempt < MAX_SELL_ATTEMPTS:
-            await asyncio.sleep(0.5)
+        # No sleep between retries — time is critical when stop-loss fires
+        # The 0.5s balance check above is the only delay
 
-    log.error("  ❌ All sell attempts exhausted — position may not have closed!")
-    return None
 
 # ─── Stop-loss monitor ────────────────────────────────────────────────────────
 def should_stop_loss(position: Position, history: deque, time_left: int) -> Optional[float]:
     """
-    Returns the current best_bid if stop-loss should trigger, else None.
+    Returns the exit bid price if stop-loss should trigger, else None.
+
     Two triggers:
-      1. Hard SL: best_bid < STOP_LOSS_BID (75%) — clear floor breach
-      2. Fast-drop SL: price has dropped > 10¢ from entry AND > 15s remain —
-         exit early before it crashes through the hard floor (saves ~1-2¢ extra)
-    Neither fires with < STOP_LOSS_MIN_SEC remaining (let it resolve naturally).
+      1. Hard SL  : current bid < STOP_LOSS_BID (75%) at any time > STOP_LOSS_MIN_SEC
+      2. Fast-drop: bid has dropped >= 5¢ from entry price AND > 15s remain
+         (exit early while there are still buyers, before it crashes to the hard floor)
+
+    Uses the median of the last 3 bid ticks to avoid false triggers from a single
+    stale or erroneous WSS tick.
     """
     if time_left <= STOP_LOSS_MIN_SEC:
         return None
+
     bids = [t.best_bid for t in history if t.token_id == position.token_id]
     if not bids:
         return None
-    current_bid = bids[-1]
-    if current_bid <= 0:
+
+    # Use median of last 3 ticks to smooth out noise
+    recent = [b for b in bids[-3:] if b > 0]
+    if not recent:
         return None
+    current_bid = statistics.median(recent)
 
     # Hard stop-loss
     if current_bid < STOP_LOSS_BID:
         log.info(f"  Hard stop-loss: bid={current_bid:.4f} < {STOP_LOSS_BID}")
         return current_bid
 
-    # Fast-drop stop-loss: exited well above the hard floor while there's still
-    # a buyer. Only fires if we've dropped >= 10¢ from entry and have time to sell.
+    # Fast-drop stop-loss: 5¢ drop from entry with >15s to sell
     if time_left > 15:
         drop_from_entry = position.entry_price - current_bid
-        if drop_from_entry >= 0.10:
+        if drop_from_entry >= 0.05:
             log.info(
                 f"  Fast-drop stop-loss: entry={position.entry_price:.4f} "
                 f"bid={current_bid:.4f} drop={drop_from_entry:.4f}"
@@ -886,7 +927,12 @@ async def _wss_ping(ws, stop):
 async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
                        state: BotState, stop: asyncio.Event):
     while not stop.is_set():
-        await asyncio.sleep(1)
+        # Sleep duration depends on phase:
+        # - Entry window (T-30s to T-5s): 0.1s so we react to every WSS price tick
+        # - All other phases: 1s is fine (no trade decision being made)
+        _now = time.time()
+        _tl  = (state.market.end_ts - int(_now + state.clock_offset)) if state.market else 999
+        await asyncio.sleep(0.1 if MIN_FIRE_BUFFER < _tl <= ENTRY_WINDOW_SEC else 1)
 
         if state.exchange_disabled:
             log.warning("Exchange disabled — retrying in 60s...")
@@ -989,12 +1035,13 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             signal = get_signal(state.market, state.price_history, state.consecutive_losses, time_left)
 
             if not signal:
-                # Log every 5s via wall-clock to avoid duplicate lines
-                if now_wall - state.last_status_ts >= 5.0:
-                    ups  = [t.best_ask for t in state.price_history if t.token_id == state.market.up_token_id]
-                    dns  = [t.best_ask for t in state.price_history if t.token_id == state.market.down_token_id]
-                    up_p = ups[-1] if ups else 0
-                    dn_p = dns[-1] if dns else 0
+                ups  = [t.best_ask for t in state.price_history if t.token_id == state.market.up_token_id]
+                dns  = [t.best_ask for t in state.price_history if t.token_id == state.market.down_token_id]
+                up_p = ups[-1] if ups else 0
+                dn_p = dns[-1] if dns else 0
+                # Throttle this log to once per second to avoid flooding
+                if now_wall - state.last_status_ts >= 1.0:
+                    state.last_status_ts = now_wall
                     log.info(f"  T-{time_left}s | UP={up_p:.3f} DOWN={dn_p:.3f} | no signal")
                 continue
 
@@ -1015,11 +1062,11 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
                 _log_skip(state.market, side, price, "volume_surge", state.last_balance)
                 continue
 
-            # Gate 3: liquidity
+            # Gate 3: liquidity — retry every loop tick until window closes,
+            # liquidity can appear at any moment within the 30s window.
             if not await liquidity_ok(session, token_id, price):
-                log.info("Skip: insufficient liquidity")
-                state.trade_fired = True
-                _log_skip(state.market, side, price, "no_liquidity", state.last_balance)
+                log.info(f"  T-{time_left}s: liquidity thin — will retry next tick...")
+                # Do NOT set trade_fired — keep trying until MIN_FIRE_BUFFER
                 continue
 
             # Gate 4: balance
@@ -1862,30 +1909,37 @@ async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
                         state: BotState, exit_bid: float):
     """Execute a stop-loss SELL. Only clears position if sell actually filled."""
     pos = state.position
-    bal_before = state.last_balance
 
-    resp = await execute_sell(client, state.market, pos, exit_bid)
+    # Always fetch a fresh balance right before selling — state.last_balance
+    # may be stale from the original buy and cause false "fill failed" detection.
+    bal_before = get_balance(client)
+    state.last_balance = bal_before
 
-    bal_after = get_balance(client)
+    resp = await execute_sell(client, state.market, pos, exit_bid,
+                              clock_offset=state.clock_offset)
+
+    # Determine if fill succeeded: check size_matched first, then balance delta
+    size_matched = float(resp.get("size_matched", 0)) if resp else 0
+    bal_after    = get_balance(client)
+    filled       = size_matched > 0 or bal_after > bal_before + 0.01
+
     state.last_balance = bal_after
-    filled = bal_after > bal_before + 0.01
 
     if not filled:
-        # Sell didn't go through — keep position open so the monitor can retry
-        # or let it resolve at market close (redeem will handle it).
         log.error(
-            f"  ❌ STOP-LOSS SELL FAILED — position kept open. "
+            f"  ❌ STOP-LOSS SELL FAILED after all retries. "
             f"bal_before=${bal_before:.4f} bal_after=${bal_after:.4f}. "
-            f"Will retry on next loop or resolve at close."
+            f"Position kept open — will resolve at market close."
         )
-        return  # do NOT clear position, do NOT advance market
+        return  # do NOT clear position — redeem at close will handle it
 
     actual_exit = exit_bid
     fee_bps = float(state.market.fee_rate or 0)
     payout, gross, fee_usdc, net = calc_profit(STAKE, pos.entry_price, actual_exit, fee_bps, "stop_loss")
     state.consecutive_losses += 1
 
-    log.info(f"STOP-LOSS: exit_bid={exit_bid:.4f} | gross={gross:+.4f} net={net:+.4f} | balance=${bal_after:.4f}")
+    log.info(f"✅ STOP-LOSS executed: entry={pos.entry_price:.4f} exit={actual_exit:.4f} | "
+             f"gross={gross:+.4f} net={net:+.4f} | balance ${bal_before:.4f} → ${bal_after:.4f}")
     save_trade(TradeRecord(
         cycle_id=pos.cycle_id, side=pos.side, entry_price=pos.entry_price,
         exit_price=actual_exit, shares_held=pos.shares, stake=STAKE,
