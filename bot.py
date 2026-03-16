@@ -137,8 +137,8 @@ OSCILLATION_BAD_SWINGS  = 2      # skip if >= this many BAD reverse ticks found
 # Within LATE_ENTRY_MAX_T seconds of close the market has less time to recover
 # from a sudden flip, so we demand a higher ask before entering.
 # Effective threshold = base/adaptive threshold + LATE_ENTRY_SURCHARGE.
-LATE_ENTRY_MAX_T     = 20    # seconds from close where tightening kicks in
-LATE_ENTRY_SURCHARGE = 0.02  # add 2¢ to required ask when time_left < LATE_ENTRY_MAX_T
+LATE_ENTRY_MAX_T     = 3    # seconds from close where tightening kicks in
+LATE_ENTRY_SURCHARGE = 0.01  # add 2¢ to required ask when time_left < LATE_ENTRY_MAX_T
 
 TRADES_FILE = Path("trades.json")
 
