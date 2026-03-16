@@ -220,9 +220,13 @@ class BotState:
     last_status_ts: float         = 0.0    # deduplicate status log lines
     redeemed_condition_ids: set   = field(default_factory=set)  # prevent double-redeem
     # ── Compounding stake ─────────────────────────────────────────────────────
-    # Starts at BASE_STAKE ($5). On win: next stake = BASE_STAKE + last net profit.
-    # On loss / stop-loss: resets back to BASE_STAKE.
-    current_stake: float          = 5.00   # live stake for next trade (updated after each outcome)
+    # compound_base = the INTENDED stake for the current cycle (never corrupted by
+    #                 partial FAK fills). This is what gets compounded on win.
+    # current_stake = same as compound_base; used as the order size target.
+    # On win:  compound_base += net_profit  (grow the base)
+    # On loss/stop: compound_base = STAKE   (reset to $5 base)
+    current_stake: float          = 5.00   # live stake for next trade
+    compound_base: float          = 5.00   # intended stake — never corrupted by partial fills
     last_net_profit: float        = 0.0    # net profit from the last winning trade
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
@@ -1071,13 +1075,20 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             continue  # holding, still monitoring
 
         # ── PRE-SIGN at T-40s to T-31s ────────────────────────────────────
+        # Only check price >= BASE_THRESHOLD (99%) — no stability/oscillation
+        # filters here. Those run again at T-30s before the order actually fires.
+        # Goal: have the signed order ready the moment entry window opens.
         if ENTRY_WINDOW_SEC < time_left <= PRESIGN_BEFORE and not state.presigned_order:
-            signal = get_signal(state.market, state.price_history, state.consecutive_losses, time_left)
-            if signal:
-                side, token_id, price = signal
-                state.presigned_order = presign_order(client, state.market, token_id, price, stake=state.current_stake)
-                state.presigned_for   = token_id
-                log.info(f"Pre-signed at T-{time_left}s: {side.upper()} @ {price:.4f} [stake=${state.current_stake:.4f}]")
+            for token_id, side_label in [
+                (state.market.up_token_id,   "up"),
+                (state.market.down_token_id, "down"),
+            ]:
+                asks = [t.best_ask for t in state.price_history if t.token_id == token_id]
+                if asks and asks[-1] >= BASE_THRESHOLD:
+                    state.presigned_order = presign_order(client, state.market, token_id, asks[-1], stake=state.current_stake)
+                    state.presigned_for   = token_id
+                    log.info(f"Pre-signed at T-{time_left}s: {side_label.upper()} @ {asks[-1]:.4f} [stake=${state.current_stake:.4f}]")
+                    break
 
         # ── ENTRY WINDOW: T-30s to T-3s ───────────────────────────────────
         if MIN_FIRE_BUFFER < time_left <= ENTRY_WINDOW_SEC and not state.trade_fired:
@@ -1821,15 +1832,19 @@ async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, 
             state.consecutive_losses = 0
             state.consecutive_wins   = 0
             log.info("[STREAK] 5 consecutive wins — adaptive threshold reset to base.")
-        # ── Compounding: next stake = current_stake + net profit from this win ──
+        # ── Compounding: grow the intended base by net profit ──────────────
+        # compound_base is the INTENDED stake — never corrupted by partial fills.
+        # We compound on this, not on pos.stake (actual filled amount).
         state.last_net_profit  = net
-        state.current_stake    = round(state.current_stake + net, 4)
-        log.info(f"[COMPOUND] WIN — next stake: ${state.current_stake:.4f} (prev + ${net:.4f} profit)")
+        state.compound_base    = round(state.compound_base + net, 4)
+        state.current_stake    = state.compound_base
+        log.info(f"[COMPOUND] WIN — compound_base: ${state.compound_base:.4f} (prev + ${net:.4f} profit)")
     else:
         state.consecutive_losses += 1
         state.consecutive_wins   = 0
-        # ── Compounding: reset stake to BASE_STAKE on loss ────────────────
+        # ── Compounding: reset both to BASE_STAKE on loss ─────────────────
         state.last_net_profit = 0.0
+        state.compound_base   = STAKE
         state.current_stake   = STAKE
         log.info(f"[COMPOUND] LOSS — stake reset to base ${STAKE:.2f}")
 
@@ -2010,8 +2025,9 @@ async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
     payout, gross, fee_usdc, net = calc_profit(trade_stake, pos.entry_price, actual_exit, fee_bps, "stop_loss")
     state.consecutive_losses += 1
     state.consecutive_wins   = 0
-    # ── Compounding: reset stake to BASE_STAKE on stop-loss ──────────────────
+    # ── Compounding: reset both to BASE_STAKE on stop-loss ───────────────────
     state.last_net_profit = 0.0
+    state.compound_base   = STAKE
     state.current_stake   = STAKE
     log.info(f"[COMPOUND] STOP-LOSS — stake reset to base ${STAKE:.2f}")
 
