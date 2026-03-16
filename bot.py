@@ -104,6 +104,7 @@ FUNDER_ADDRESS  = os.environ["POLYMARKET_FUNDER_ADDRESS"]
 CLOB_HOST       = "https://clob.polymarket.com"
 GAMMA_API       = "https://gamma-api.polymarket.com"
 WSS_MARKET      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+WSS_RTDS        = "wss://ws-subscriptions-clob.polymarket.com/ws/live"  # RTDS Chainlink feed
 CHAIN_ID        = 137
 CTF_CONTRACT    = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_E          = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -114,8 +115,8 @@ RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RE
 STAKE             = 6.00    # Base stake per trade
 BASE_THRESHOLD    = 0.99    # Buy when dominant side ask >= 99%
 ADAPTIVE_THRESH   = 0.99    # Same threshold even after losses (99% only)
-ENTRY_WINDOW_SEC  = 45      # Enter any time price >= threshold AND <=45s remain
-PRESIGN_BEFORE    = 55      # Build signed order at T-55s (ready for T-45s window)
+ENTRY_WINDOW_SEC  = 30      # Enter only in last 30 seconds
+PRESIGN_BEFORE    = 40      # Build signed order at T-40s (ready for T-30s window)
 MIN_FIRE_BUFFER   = 5       # Never fire if < 5s remain (too risky)
 STOP_LOSS_BID     = 0.85    # Exit position if best_bid falls below this
 STOP_LOSS_MIN_SEC = 5       # Don't stop-loss if < 5s remain (just let it resolve)
@@ -123,6 +124,14 @@ STABILITY_N       = 5       # Price ticks needed for stability check
 MAX_STD_DEV       = 0.015   # Max std-dev for stability
 MIN_LIQUIDITY     = 3.0     # Min USDC ask depth
 MAX_SPREAD        = 0.04    # Skip if bid-ask spread > 4¢
+
+# ── BTC distance + volatility filter (Chainlink-based) ────────────────────────
+# Polymarket BTC 5m markets resolve based on Chainlink BTC/USD price.
+# The "Price to Beat" is the Chainlink price at window open (btc_opening_price).
+# We subscribe to Polymarket's own RTDS Chainlink feed to track this in real-time.
+MIN_BTC_DISTANCE    = 60.0  # live BTC must be >= $60 away from opening price in bet direction
+BTC_VOLATILITY_SEC  = 60    # look-back window in seconds to measure BTC volatility
+BTC_MAX_VOLATILITY  = 150.0 # skip if BTC high-low range > $150 in last 60s (too choppy)
 
 # ── Oscillation / two-way volatility filter ───────────────────────────────────
 # Skip if the Polymarket probability is swinging wildly in BOTH directions.
@@ -228,6 +237,14 @@ class BotState:
     current_stake: float          = STAKE   # live stake for next trade
     compound_base: float          = STAKE   # intended stake — never corrupted by partial fills
     last_net_profit: float        = 0.0     # net profit from the last winning trade
+    # ── Chainlink BTC/USD price tracking ──────────────────────────────────────
+    # Populated by run_chainlink_wss from Polymarket's RTDS feed (no auth needed).
+    # btc_opening_price: Chainlink price at window open = "Price to Beat"
+    # btc_live_price:    latest Chainlink tick
+    # btc_price_history: list of (timestamp, price) tuples for volatility check
+    btc_opening_price: float      = 0.0
+    btc_live_price: float         = 0.0
+    btc_price_history: list       = field(default_factory=list)  # (ts, price) pairs
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
 def load_trades() -> list:
@@ -818,6 +835,83 @@ def calc_profit(stake, entry_price, exit_price, fee_rate_bps, outcome):
     return round(payout,6), round(gross,6), round(fee_usdc,6), round(net,6)
 
 # ─── WebSocket ────────────────────────────────────────────────────────────────
+async def run_chainlink_wss(state: BotState, stop: asyncio.Event):
+    """
+    Subscribe to Polymarket's RTDS Chainlink feed to get the same BTC/USD price
+    Polymarket uses for settlement. No auth required.
+
+    Tracks:
+      state.btc_live_price    — updated on every tick
+      state.btc_opening_price — set once per window from the first tick at/after
+                                window_start_ts (= market.end_ts - 300).
+                                This is the exact "Price to Beat".
+      state.btc_price_history — rolling list of (ts, price) for volatility check.
+                                Pruned to last BTC_VOLATILITY_SEC seconds.
+    """
+    SUB_MSG = json.dumps({
+        "action": "subscribe",
+        "subscriptions": [{
+            "topic":   "crypto_prices_chainlink",
+            "type":    "*",
+            "filters": "{\"symbol\":\"btc/usd\"}"
+        }]
+    })
+
+    log.info("[CHAINLINK] Starting Chainlink BTC/USD feed...")
+    while not stop.is_set():
+        try:
+            async with websockets.connect(WSS_RTDS, ping_interval=None, open_timeout=10) as ws:
+                await ws.send(SUB_MSG)
+                log.info("[CHAINLINK] ✅ Subscribed to crypto_prices_chainlink btc/usd")
+
+                async for raw in ws:
+                    if stop.is_set():
+                        break
+                    if raw in ("PING", "PONG"):
+                        continue
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+
+                    if msg.get("topic") != "crypto_prices_chainlink":
+                        continue
+                    payload = msg.get("payload", {})
+                    if payload.get("symbol", "").lower() != "btc/usd":
+                        continue
+
+                    btc_price = float(payload.get("value", 0) or 0)
+                    if btc_price <= 0:
+                        continue
+
+                    now_ts = time.time()
+                    state.btc_live_price = btc_price
+
+                    # Maintain price history — prune to last BTC_VOLATILITY_SEC seconds
+                    state.btc_price_history.append((now_ts, btc_price))
+                    cutoff = now_ts - BTC_VOLATILITY_SEC
+                    state.btc_price_history = [
+                        (t, p) for t, p in state.btc_price_history if t >= cutoff
+                    ]
+
+                    # Capture opening price once per window.
+                    # Window start = market.end_ts - 300.
+                    # The RTDS timestamp is in milliseconds.
+                    if state.market and state.btc_opening_price == 0.0:
+                        window_start_ts = state.market.end_ts - 300
+                        tick_ts_raw = payload.get("timestamp", 0)
+                        tick_ts = tick_ts_raw / 1000 if tick_ts_raw > 1e10 else tick_ts_raw
+                        if tick_ts >= window_start_ts:
+                            state.btc_opening_price = btc_price
+                            log.info(f"[CHAINLINK] Opening price captured: ${btc_price:.2f} "
+                                     f"(window_start={window_start_ts})")
+
+        except Exception as e:
+            if not stop.is_set():
+                log.warning(f"[CHAINLINK] dropped (reconnect in 3s): {e}")
+                await asyncio.sleep(3)
+
+
 async def run_market_wss(state: BotState, client: ClobClient,
                          session: aiohttp.ClientSession, stop: asyncio.Event):
     log.info("[WSS] WebSocket task started — waiting for market...")
@@ -1138,6 +1232,45 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
                 state.trade_fired = True
                 _log_skip(state.market, side, price, "insufficient_funds", bal)
                 continue
+
+            # Gate 5: BTC distance from opening price (Chainlink)
+            # Only trade if live BTC is >= $60 away from window opening price
+            # in the direction we're betting. Skips dangerous "coin-flip" setups.
+            # If Chainlink feed not ready yet, allow trade as failsafe.
+            if state.btc_opening_price > 0 and state.btc_live_price > 0:
+                btc_gap = state.btc_live_price - state.btc_opening_price
+                if side == "up" and btc_gap < MIN_BTC_DISTANCE:
+                    log.info(f"  T-{time_left}s: BTC too close for UP — "
+                             f"live=${state.btc_live_price:.2f} open=${state.btc_opening_price:.2f} "
+                             f"gap=+${btc_gap:.2f} (need +${MIN_BTC_DISTANCE:.0f}) — retrying...")
+                    continue
+                elif side == "down" and (-btc_gap) < MIN_BTC_DISTANCE:
+                    log.info(f"  T-{time_left}s: BTC too close for DOWN — "
+                             f"live=${state.btc_live_price:.2f} open=${state.btc_opening_price:.2f} "
+                             f"gap=-${-btc_gap:.2f} (need -${MIN_BTC_DISTANCE:.0f}) — retrying...")
+                    continue
+                else:
+                    log.info(f"  BTC distance OK: live=${state.btc_live_price:.2f} "
+                             f"open=${state.btc_opening_price:.2f} gap=${btc_gap:+.2f}")
+            else:
+                log.info(f"  BTC distance: Chainlink not ready — skipping check "
+                         f"(live={state.btc_live_price:.2f} open={state.btc_opening_price:.2f})")
+
+            # Gate 6: BTC volatility (Chainlink)
+            # Skip if BTC has been swinging too wildly (high-low range > $150
+            # in last 60 seconds). Wild BTC movement means the Polymarket price
+            # can flip even at 99% — the outcome isn't settled yet.
+            if len(state.btc_price_history) >= 3:
+                recent_prices = [p for _, p in state.btc_price_history]
+                btc_range = max(recent_prices) - min(recent_prices)
+                if btc_range > BTC_MAX_VOLATILITY:
+                    log.info(f"  T-{time_left}s: BTC too volatile — "
+                             f"range=${btc_range:.2f} over last {BTC_VOLATILITY_SEC}s "
+                             f"(max=${BTC_MAX_VOLATILITY:.0f}) — retrying...")
+                    continue
+                else:
+                    log.info(f"  BTC volatility OK: range=${btc_range:.2f} "
+                             f"over last {BTC_VOLATILITY_SEC}s")
 
             # All gates passed — fire and keep retrying until filled or window closes
             state.trade_fired = True
@@ -2083,13 +2216,15 @@ async def _advance_market(client: ClobClient, session: aiohttp.ClientSession, st
         server_ts = int(await asyncio.to_thread(client.get_server_time))
     except Exception:
         server_ts = int(time.time() + state.clock_offset)
-    state.trade_fired      = False
-    state.resolved         = None   # cleared here — never carry over to next market
-    state.presigned_order  = None
-    state.presigned_for    = None
-    state.position         = None  # always clear position on advance
-    state.price_history    = deque(maxlen=200)
-    state.last_status_ts   = 0.0   # reset so status logs immediately on new cycle
+    state.trade_fired       = False
+    state.resolved          = None   # cleared here — never carry over to next market
+    state.presigned_order   = None
+    state.presigned_for     = None
+    state.position          = None  # always clear position on advance
+    state.price_history     = deque(maxlen=200)
+    state.last_status_ts    = 0.0   # reset so status logs immediately on new cycle
+    state.btc_opening_price = 0.0   # reset so next window captures fresh opening price
+    state.btc_price_history = []    # reset volatility history for new window
 
     if state.next_market:
         m = await _gamma_slug(session, state.next_market.slug)
@@ -2259,11 +2394,11 @@ async def run_bot():
         loop.add_signal_handler(sig, stop.set)
 
     log.info("=" * 65)
-    log.info(" Polymarket BTC 5m Bot — Compounding | 99% threshold | 3-layer redeem")
+    log.info(" Polymarket BTC 5m Bot — Compounding | 99% | Chainlink distance+volatility filter")
     log.info(f" Stake: base=${STAKE:.2f} | compounds on WIN, resets on LOSS/STOP-LOSS")
     log.info(f" Buy: >= {BASE_THRESHOLD*100:.0f}% | entry window T-{ENTRY_WINDOW_SEC}s | presign T-{PRESIGN_BEFORE}s")
     log.info(f" Stop-loss: sell if bid < {STOP_LOSS_BID*100:.0f}% AND > {STOP_LOSS_MIN_SEC}s remain")
-    log.info(f" Filters: spread<{MAX_SPREAD} | liq>${MIN_LIQUIDITY} | vol-surge>3x | oscillation>{OSCILLATION_MAX_REVERSE}")
+    log.info(f" BTC filter: distance >= ${MIN_BTC_DISTANCE:.0f} | volatility <= ${BTC_MAX_VOLATILITY:.0f}/{BTC_VOLATILITY_SEC}s")
     log.info(" REDEEM: 3-layer cascade (relayer PROXY → poly-web3 → proxy.forward)")
     log.info("=" * 65)
 
@@ -2294,6 +2429,7 @@ async def run_bot():
         try:
             await asyncio.gather(
                 run_market_wss(state, client, session, stop),
+                run_chainlink_wss(state, stop),
                 trading_loop(client, session, state, stop),
                 heartbeat_loop(client, state, stop),
                 cred_refresh_loop(client, stop),
