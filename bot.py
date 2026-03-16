@@ -111,18 +111,18 @@ PARENT_COLLECTION_ID = "0x" + ("00" * 32)
 RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RELAYER_URL") or "https://relayer-v2.polymarket.com/"
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-STAKE             = 6.00    # Fixed $6.00 per trade (min 5 shares at 0.93+ price)
-BASE_THRESHOLD    = 0.99    # Buy when dominant side ask >= 95%
-ADAPTIVE_THRESH   = 0.99    # Raised after 2 consecutive losses
-ENTRY_WINDOW_SEC  = 45      # Enter any time price >= threshold AND <=30s remain
-PRESIGN_BEFORE    = 55      # Build signed order at T-40s (removes signing latency)
+STAKE             = 6.00    # Base stake per trade
+BASE_THRESHOLD    = 0.99    # Buy when dominant side ask >= 99%
+ADAPTIVE_THRESH   = 0.99    # Same threshold even after losses (99% only)
+ENTRY_WINDOW_SEC  = 45      # Enter any time price >= threshold AND <=45s remain
+PRESIGN_BEFORE    = 55      # Build signed order at T-55s (ready for T-45s window)
 MIN_FIRE_BUFFER   = 5       # Never fire if < 5s remain (too risky)
 STOP_LOSS_BID     = 0.85    # Exit position if best_bid falls below this
 STOP_LOSS_MIN_SEC = 5       # Don't stop-loss if < 5s remain (just let it resolve)
 STABILITY_N       = 5       # Price ticks needed for stability check
 MAX_STD_DEV       = 0.015   # Max std-dev for stability
 MIN_LIQUIDITY     = 3.0     # Min USDC ask depth
-MAX_SPREAD        = 0.04    # Skip if bid-ask spread > 3¢
+MAX_SPREAD        = 0.04    # Skip if bid-ask spread > 4¢
 
 # ── Oscillation / two-way volatility filter ───────────────────────────────────
 # Skip if the Polymarket probability is swinging wildly in BOTH directions.
@@ -137,8 +137,8 @@ OSCILLATION_BAD_SWINGS  = 2      # skip if >= this many BAD reverse ticks found
 # Within LATE_ENTRY_MAX_T seconds of close the market has less time to recover
 # from a sudden flip, so we demand a higher ask before entering.
 # Effective threshold = base/adaptive threshold + LATE_ENTRY_SURCHARGE.
-LATE_ENTRY_MAX_T     = 3    # seconds from close where tightening kicks in
-LATE_ENTRY_SURCHARGE = 0.01  # add 2¢ to required ask when time_left < LATE_ENTRY_MAX_T
+LATE_ENTRY_MAX_T     = 3     # seconds from close where tightening kicks in
+LATE_ENTRY_SURCHARGE = 0.01  # add 1¢ to required ask when time_left < LATE_ENTRY_MAX_T
 
 TRADES_FILE = Path("trades.json")
 
@@ -220,14 +220,14 @@ class BotState:
     last_status_ts: float         = 0.0    # deduplicate status log lines
     redeemed_condition_ids: set   = field(default_factory=set)  # prevent double-redeem
     # ── Compounding stake ─────────────────────────────────────────────────────
-    # compound_base = the INTENDED stake for the current cycle (never corrupted by
-    #                 partial FAK fills). This is what gets compounded on win.
-    # current_stake = same as compound_base; used as the order size target.
-    # On win:  compound_base += net_profit  (grow the base)
-    # On loss/stop: compound_base = STAKE   (reset to $5 base)
-    current_stake: float          = 5.00   # live stake for next trade
-    compound_base: float          = 5.00   # intended stake — never corrupted by partial fills
-    last_net_profit: float        = 0.0    # net profit from the last winning trade
+    # compound_base = the INTENDED stake, never corrupted by partial FAK fills.
+    #                 This is what gets compounded on win.
+    # current_stake = same as compound_base; what presign_order and _do_buy use.
+    # On win:       compound_base += net_profit, current_stake = compound_base
+    # On loss/stop: compound_base = STAKE, current_stake = STAKE
+    current_stake: float          = STAKE   # live stake for next trade
+    compound_base: float          = STAKE   # intended stake — never corrupted by partial fills
+    last_net_profit: float        = 0.0     # net profit from the last winning trade
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
 def load_trades() -> list:
@@ -612,7 +612,7 @@ def volume_surge(trade_history: deque, token_id: str) -> bool:
     older  = sum(t.size for t in trade_history if t.token_id == token_id and 30 < now - t.ts <= 60)
     if older == 0: return False
     ratio = recent / older
-    surge = ratio > 8.0  # Raised from 3.0 — at 95%+ threshold, high volume is expected
+    surge = ratio > 3.0
     log.info(f"  Volume momentum: recent={recent:.1f} older={older:.1f} ratio={ratio:.1f} {'SURGE-SKIP' if surge else 'ok'}")
     return surge
 
@@ -1074,10 +1074,10 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
 
             continue  # holding, still monitoring
 
-        # ── PRE-SIGN at T-40s to T-31s ────────────────────────────────────
+        # ── PRE-SIGN at T-55s to T-46s ────────────────────────────────────
         # Only check price >= BASE_THRESHOLD (99%) — no stability/oscillation
-        # filters here. Those run again at T-30s before the order actually fires.
-        # Goal: have the signed order ready the moment entry window opens.
+        # filters here. Those run at T-45s before the order actually fires.
+        # Goal: have a signed order ready the moment the entry window opens.
         if ENTRY_WINDOW_SEC < time_left <= PRESIGN_BEFORE and not state.presigned_order:
             for token_id, side_label in [
                 (state.market.up_token_id,   "up"),
@@ -1085,9 +1085,13 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             ]:
                 asks = [t.best_ask for t in state.price_history if t.token_id == token_id]
                 if asks and asks[-1] >= BASE_THRESHOLD:
-                    state.presigned_order = presign_order(client, state.market, token_id, asks[-1], stake=state.current_stake)
-                    state.presigned_for   = token_id
-                    log.info(f"Pre-signed at T-{time_left}s: {side_label.upper()} @ {asks[-1]:.4f} [stake=${state.current_stake:.4f}]")
+                    state.presigned_order = presign_order(
+                        client, state.market, token_id, asks[-1],
+                        stake=state.current_stake
+                    )
+                    state.presigned_for = token_id
+                    log.info(f"Pre-signed at T-{time_left}s: {side_label.upper()} @ {asks[-1]:.4f} "
+                             f"[stake=${state.current_stake:.4f}]")
                     break
 
         # ── ENTRY WINDOW: T-30s to T-3s ───────────────────────────────────
@@ -1842,7 +1846,7 @@ async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, 
     else:
         state.consecutive_losses += 1
         state.consecutive_wins   = 0
-        # ── Compounding: reset both to BASE_STAKE on loss ─────────────────
+        # ── Compounding: reset both to BASE_STAKE on loss ────────────────
         state.last_net_profit = 0.0
         state.compound_base   = STAKE
         state.current_stake   = STAKE
@@ -2242,12 +2246,12 @@ async def run_bot():
         loop.add_signal_handler(sig, stop.set)
 
     log.info("=" * 65)
-    log.info(" Polymarket BTC 5m Bot v8  —  Compounding stake | 95% threshold | Sell retry + position guard")
-    log.info(f" Stake: base=${STAKE:.2f} | compounds on WIN (base + net profit), resets on LOSS/STOP-LOSS")
-    log.info(f" Buy: >= {BASE_THRESHOLD*100:.0f}% (adaptive {ADAPTIVE_THRESH*100:.0f}% after 2 losses)")
+    log.info(" Polymarket BTC 5m Bot — Compounding | 99% threshold | 3-layer redeem")
+    log.info(f" Stake: base=${STAKE:.2f} | compounds on WIN, resets on LOSS/STOP-LOSS")
+    log.info(f" Buy: >= {BASE_THRESHOLD*100:.0f}% | entry window T-{ENTRY_WINDOW_SEC}s | presign T-{PRESIGN_BEFORE}s")
     log.info(f" Stop-loss: sell if bid < {STOP_LOSS_BID*100:.0f}% AND > {STOP_LOSS_MIN_SEC}s remain")
-    log.info(f" Filters: spread<{MAX_SPREAD} | liq>${MIN_LIQUIDITY} | vol-momentum | presign@T-{PRESIGN_BEFORE}s")
-    log.info(" REDEEM: 3-layer cascade (relayer PROXY → poly-web3 → proxy.forward) — auto-claimed ~2-5 min after close")
+    log.info(f" Filters: spread<{MAX_SPREAD} | liq>${MIN_LIQUIDITY} | vol-surge>3x | oscillation>{OSCILLATION_MAX_REVERSE}")
+    log.info(" REDEEM: 3-layer cascade (relayer PROXY → poly-web3 → proxy.forward)")
     log.info("=" * 65)
 
     async with aiohttp.ClientSession() as session:
