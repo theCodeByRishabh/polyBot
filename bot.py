@@ -1171,10 +1171,23 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
             log.info(f"  Buy abort: only {now_left}s left, too close to close.")
             break
 
-        # Attempt 1: use presigned order if it was built for this token at this price
+        # Attempt 1: use presigned order if it was built for this token
+        # IMPORTANT: verify the price is still >= BASE_THRESHOLD before using it.
+        # If price dropped since presign time, discard and re-sign at current price.
         if attempt == 1 and state.presigned_order and state.presigned_for == token_id:
-            order = state.presigned_order
-            log.info(f"  Buy attempt 1 (presigned) @ T-{now_left}s price={price:.4f}")
+            if price >= BASE_THRESHOLD:
+                order = state.presigned_order
+                log.info(f"  Buy attempt 1 (presigned) @ T-{now_left}s price={price:.4f}")
+            else:
+                log.warning(f"  Presigned order discarded — current price {price:.4f} < {BASE_THRESHOLD} threshold. Re-signing.")
+                state.presigned_order = None
+                state.presigned_for   = None
+                order = presign_order(client, state.market, token_id, price, stake=stake)
+                if not order:
+                    log.warning(f"  Attempt {attempt}: presign failed, retrying in 1s...")
+                    await asyncio.sleep(1)
+                    continue
+                log.info(f"  Buy attempt {attempt} (fresh sign) @ T-{now_left}s price={price:.4f}")
         else:
             # Re-sign fresh order for all retries
             order = presign_order(client, state.market, token_id, price, stake=stake)
