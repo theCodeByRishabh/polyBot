@@ -193,6 +193,7 @@ class Position:
     side: str
     entry_price: float
     shares: float           # number of outcome tokens held
+    stake: float            # actual dollars spent (compound stake at time of buy)
     cycle_id: str
     market: "Market"        # type annotation forward ref as string
 
@@ -1228,7 +1229,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
         log.info(f"✅ BUY CONFIRMED: spent=${filled_amount:.4f} shares={shares:.6f} @ {actual_price:.4f} after {attempt} attempt(s) ({elapsed}s poll)")
         state.position = Position(
             side=side, token_id=token_id, entry_price=actual_price,
-            shares=shares, cycle_id=_cycle_id(),
+            shares=shares, stake=filled_amount, cycle_id=_cycle_id(),
             market=state.market,
         )
         state.last_balance = bal_after_attempt
@@ -1263,7 +1264,7 @@ async def _do_buy(client, session, state: BotState, side, token_id, price, bal_b
                     f"shares={shares:.6f} @ {price:.4f} | bal_before=${bal_before:.4f} bal_now=${bal_after_attempt:.4f}")
         state.position = Position(
             side=side, token_id=token_id, entry_price=price,
-            shares=shares, cycle_id=_cycle_id(),
+            shares=shares, stake=stake, cycle_id=_cycle_id(),
             market=state.market,
         )
         state.last_balance = bal_after_attempt
@@ -1820,10 +1821,10 @@ async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, 
             state.consecutive_losses = 0
             state.consecutive_wins   = 0
             log.info("[STREAK] 5 consecutive wins — adaptive threshold reset to base.")
-        # ── Compounding: next stake = BASE_STAKE + net profit from this win ──
+        # ── Compounding: next stake = current_stake + net profit from this win ──
         state.last_net_profit  = net
-        state.current_stake    = round(STAKE + net, 4)
-        log.info(f"[COMPOUND] WIN — next stake: ${STAKE:.2f} + ${net:.4f} profit = ${state.current_stake:.4f}")
+        state.current_stake    = round(state.current_stake + net, 4)
+        log.info(f"[COMPOUND] WIN — next stake: ${state.current_stake:.4f} (prev + ${net:.4f} profit)")
     else:
         state.consecutive_losses += 1
         state.consecutive_wins   = 0

@@ -170,6 +170,23 @@ def compute_stats(trades):
                 latest_bal = float(b)
                 break
 
+    # Current compound stake — inferred from the last settled trade's stake field.
+    # The bot compounds on win (stake grows) and resets on loss/stop.
+    # We derive next_stake from the most recent settled outcome:
+    #   win       → last stake + net_profit (compounded)
+    #   loss/stop → base STAKE (reset)
+    # Falls back to STAKE if no settled trades yet.
+    next_stake = STAKE
+    for t in reversed(done):
+        outcome = t.get("outcome", "")
+        if outcome == "win":
+            trade_stake = float(t.get("stake", STAKE) or STAKE)
+            net_p       = float(t.get("net_profit", 0) or 0)
+            next_stake  = round(trade_stake + net_p, 4)
+        else:
+            next_stake = STAKE
+        break  # only look at the most recent settled trade
+
     return {
         "total":       len(done),
         "wins":        len(wins),
@@ -191,6 +208,7 @@ def compute_stats(trades):
         "equity":      equity,
         "daily":       daily_list,
         "latest_bal":  latest_bal,
+        "next_stake":  next_stake,
     }
 
 # ── HTML helpers ───────────────────────────────────────────────────────────────
@@ -220,22 +238,23 @@ def build_page(trades):
     s      = compute_stats(trades)
 
     # Balance display
-    bal = s["latest_bal"]
+    bal        = s["latest_bal"]
+    next_stake = s["next_stake"]
     if bal is None:
         bal_disp, bal_cls, bal_note = "—", "dim", "No settled trades yet"
     elif bal == 0:
         bal_disp, bal_cls, bal_note = "$0.00", "danger", "Account empty — top up USDC"
-    elif bal < STAKE:
-        bal_disp, bal_cls, bal_note = f"${bal:.2f}", "warning", f"Below ${STAKE:.2f} stake — top up to resume"
+    elif bal < next_stake:
+        bal_disp, bal_cls, bal_note = f"${bal:.2f}", "warning", f"Below ${next_stake:.2f} stake — top up to resume"
     else:
-        bal_disp, bal_cls, bal_note = f"${bal:.2f}", "ok", f"Ready · next stake ${STAKE:.2f}"
+        bal_disp, bal_cls, bal_note = f"${bal:.2f}", "ok", f"Ready · next stake ${next_stake:.4f}"
 
     # Nav pill
     if bal is None:
         pclass, ptxt = "pill-dim", "Monitoring"
     elif bal == 0:
         pclass, ptxt = "pill-danger", "⚠ No Funds"
-    elif bal < STAKE:
+    elif bal < next_stake:
         pclass, ptxt = "pill-warn", "⚠ Low Balance"
     else:
         pclass, ptxt = "pill-live", "● Live"
@@ -244,8 +263,8 @@ def build_page(trades):
     alert = ""
     if bal is not None and bal == 0:
         alert = '<div class="alert alert-danger">⚠ Balance is zero — top up USDC to resume trading.</div>'
-    elif bal is not None and bal < STAKE:
-        alert = f'<div class="alert alert-warn">⚠ Balance <strong>${bal:.2f}</strong> is below the ${STAKE:.2f} stake threshold. Top up USDC to resume.</div>'
+    elif bal is not None and bal < next_stake:
+        alert = f'<div class="alert alert-warn">⚠ Balance <strong>${bal:.2f}</strong> is below the ${next_stake:.4f} compound stake. Top up USDC to resume.</div>'
 
     # Breakdown bar
     total = s["total"]
@@ -365,6 +384,8 @@ def build_page(trades):
         table_count  = table_count,
         last_upd     = now,
         stake        = f'{STAKE:.2f}',
+        next_stake   = f'{next_stake:.4f}',
+        next_stake_cls = "green" if next_stake > STAKE else "dim",
     )
 
 
@@ -642,6 +663,11 @@ tbody tr:hover td{{background:rgba(59,130,246,.04);color:var(--txt)}}
       <div class="kpi-sub">net USDC loss</div>
     </div>
     <div class="kpi">
+      <div class="kpi-lbl">Next Stake</div>
+      <div class="kpi-val {next_stake_cls}">${next_stake}</div>
+      <div class="kpi-sub">base ${stake} · compounding</div>
+    </div>
+    <div class="kpi">
       <div class="kpi-lbl">Streak</div>
       <div class="kpi-val" style="font-size:15px;line-height:1.4">{streak_disp}</div>
       <div class="kpi-sub">&nbsp;</div>
@@ -678,7 +704,7 @@ tbody tr:hover td{{background:rgba(59,130,246,.04);color:var(--txt)}}
   <div class="tcard">
     <div class="thead">
       <span class="thead-l">All Trades &mdash; Newest First</span>
-      <span class="thead-r">${stake} stake &middot; {table_count}</span>
+      <span class="thead-r">compound stake · next ${next_stake} &middot; {table_count}</span>
     </div>
     <div class="tscroll">
       <table>
