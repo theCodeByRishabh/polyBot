@@ -125,7 +125,7 @@ RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RE
 STAKE             = 5.00    # Base stake per trade
 BASE_THRESHOLD    = 0.99    # Buy when dominant side ask >= 99%
 ADAPTIVE_THRESH   = 0.99    # Same threshold even after losses (99% only)
-ENTRY_WINDOW_SEC  = 30      # Enter only in last 30 seconds
+ENTRY_WINDOW_SEC  = 40      # Enter only in last 30 seconds
 PRESIGN_BEFORE    = 40      # Build signed order at T-40s (ready for T-30s window)
 MIN_FIRE_BUFFER   = 5       # Never fire if < 5s remain (too risky)
 STOP_LOSS_BID     = 0.85    # Exit position if best_bid falls below this
