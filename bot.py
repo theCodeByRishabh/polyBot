@@ -114,7 +114,7 @@ FUNDER_ADDRESS  = os.environ["POLYMARKET_FUNDER_ADDRESS"]
 CLOB_HOST       = "https://clob.polymarket.com"
 GAMMA_API       = "https://gamma-api.polymarket.com"
 WSS_MARKET      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-WSS_RTDS        = "wss://ws-subscriptions-clob.polymarket.com/ws/live"  # RTDS Chainlink feed
+WSS_RTDS        = "wss://ws-live-data.polymarket.com"  # RTDS Chainlink feed
 CHAIN_ID        = 137
 CTF_CONTRACT    = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_E          = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -122,11 +122,11 @@ PARENT_COLLECTION_ID = "0x" + ("00" * 32)
 RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RELAYER_URL") or "https://relayer-v2.polymarket.com/"
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-STAKE             = 8.0    # Base stake per trade
+STAKE             = 5.00    # Base stake per trade
 BASE_THRESHOLD    = 0.99    # Buy when dominant side ask >= 99%
 ADAPTIVE_THRESH   = 0.99    # Same threshold even after losses (99% only)
 ENTRY_WINDOW_SEC  = 40      # Enter only in last 30 seconds
-PRESIGN_BEFORE    = 50      # Build signed order at T-40s (ready for T-30s window)
+PRESIGN_BEFORE    = 40      # Build signed order at T-40s (ready for T-30s window)
 MIN_FIRE_BUFFER   = 5       # Never fire if < 5s remain (too risky)
 STOP_LOSS_BID     = 0.85    # Exit position if best_bid falls below this
 STOP_LOSS_MIN_SEC = 5       # Don't stop-loss if < 5s remain (just let it resolve)
