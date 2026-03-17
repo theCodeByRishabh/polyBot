@@ -1,17 +1,19 @@
 """
-Polymarket Bot Dashboard v7
-Complete redesign — clean, readable, data-first trading terminal.
+Polymarket Bot Dashboard v9
+Synced with bot v9 changes.
 
-Fixes vs v6:
-  - load_trades() handles NDJSON (bot v7+) and legacy JSON array
-  - All trade data displays correctly in the table
-  - Equity curve uses Chart.js from CDN — no more blank canvas
-  - Daily P&L bar chart
-  - KPI cards always populated (even with zero data)
-  - STAKE default matches bot ($6.00)
-  - Full trade history with all relevant columns
-  - Win/Loss/Stop breakdown bar
-  - Try/except around build_page so errors show in browser, not just crash
+Changes vs v7:
+  - STAKE default updated to $5.00 (matches bot v9)
+  - brutal_sell outcome recognised: shown as BRUTAL badge (orange-red), counted
+    in stops/breakdown, included in settled trades
+  - IST trading block shown in Status panel (01:00–08:00 IST = 19:30–02:30 UTC)
+  - BTC distance filter displayed as $40 (was $60)
+  - Breakdown bar + legend updated to include Brutal Sell slice
+  - Table badge: "BRUTAL" outcome shows distinct badge
+  - compute_stats: brutal_sell counted with stops, net_profit included in totals
+  - next_stake logic: brutal_sell resets compound stake (same as stop_loss)
+  - Pending-redeem note shown when latest win trade is still awaiting redeem
+  - All other existing features retained (equity curve, daily P&L, session auth)
 """
 
 import os, json, secrets, time
@@ -28,9 +30,9 @@ DASH_PASS     = os.environ.get("DASH_PASS", "changeme")
 PORT          = int(os.environ.get("DASH_PORT", "8080"))
 SESSION_TTL   = 3600          # 1 hour for normal sessions
 REMEMBER_TTL  = 365 * 24 * 3600  # 1 year for "remember me" sessions (effectively permanent)
-STAKE         = float(os.environ.get("BOT_STAKE", "6.00"))
+STAKE         = float(os.environ.get("BOT_STAKE", "5.00"))
 
-SETTLED = {"win", "loss", "stop_loss"}
+SETTLED = {"win", "loss", "stop_loss", "brutal_sell"}   # all outcomes that are fully resolved
 
 # ── Persistent session store ───────────────────────────────────────────────────
 # Sessions are written to disk so they survive restarts, crashes, and redeploys.
@@ -125,6 +127,7 @@ def compute_stats(trades):
     wins   = [t for t in done if t["outcome"] == "win"]
     losses = [t for t in done if t["outcome"] == "loss"]
     stops  = [t for t in done if t["outcome"] == "stop_loss"]
+    brutals= [t for t in done if t["outcome"] == "brutal_sell"]
 
     total_net   = sum(t.get("net_profit",   0) or 0 for t in done)
     total_fees  = sum(t.get("fee_usdc",     0) or 0 for t in done)
@@ -170,12 +173,9 @@ def compute_stats(trades):
                 latest_bal = float(b)
                 break
 
-    # Current compound stake — inferred from the last settled trade's stake field.
-    # The bot compounds on win (stake grows) and resets on loss/stop.
-    # We derive next_stake from the most recent settled outcome:
-    #   win       → last stake + net_profit (compounded)
-    #   loss/stop → base STAKE (reset)
-    # Falls back to STAKE if no settled trades yet.
+    # Current compound stake — inferred from the last settled trade.
+    # win       → stake + net_profit (compounded)
+    # loss / stop_loss / brutal_sell → base STAKE (reset)
     next_stake = STAKE
     for t in reversed(done):
         outcome = t.get("outcome", "")
@@ -184,31 +184,50 @@ def compute_stats(trades):
             net_p       = float(t.get("net_profit", 0) or 0)
             next_stake  = round(trade_stake + net_p, 4)
         else:
+            # stop_loss, brutal_sell, loss all reset to base
             next_stake = STAKE
         break  # only look at the most recent settled trade
 
+    # Detect if latest win trade is still pending redeem
+    # (balance_after would be 0 or close to it — bot doesn't update balance until USDC arrives)
+    pending_redeem = False
+    for t in reversed(trades):
+        if not isinstance(t, dict): continue
+        if t.get("outcome") == "win":
+            bal_a = t.get("balance_after", None)
+            bal_b = t.get("balance_before", None)
+            if bal_a is not None and bal_b is not None:
+                # If balance_after did not increase after a win, redeem is still in-flight
+                if float(bal_a or 0) <= float(bal_b or 0) + 0.01:
+                    pending_redeem = True
+            break
+        if t.get("outcome") in SETTLED:
+            break  # latest settled trade was not a win
+
     return {
-        "total":       len(done),
-        "wins":        len(wins),
-        "losses":      len(losses),
-        "stops":       len(stops),
-        "skipped":     len([t for t in trades if t.get("outcome") == "skip"]),
-        "open":        len([t for t in trades if t.get("outcome") == "open"]),
-        "unmatched":   len([t for t in trades if t.get("outcome") == "unmatched"]),
-        "win_rate":    round(win_rate, 1),
-        "total_net":   round(total_net, 4),
-        "total_gross": round(total_gross, 4),
-        "total_fees":  round(total_fees, 6),
-        "total_stake": round(total_stake, 2),
-        "roi":         round(total_net / total_stake * 100, 2) if total_stake else 0.0,
-        "streak":      streak,
-        "streak_type": stype,
-        "best":        round((best["net_profit"]  or 0) if best  else 0, 4),
-        "worst":       round((worst["net_profit"] or 0) if worst else 0, 4),
-        "equity":      equity,
-        "daily":       daily_list,
-        "latest_bal":  latest_bal,
-        "next_stake":  next_stake,
+        "total":        len(done),
+        "wins":         len(wins),
+        "losses":       len(losses),
+        "stops":        len(stops),
+        "brutals":      len(brutals),
+        "skipped":      len([t for t in trades if t.get("outcome") == "skip"]),
+        "open":         len([t for t in trades if t.get("outcome") == "open"]),
+        "unmatched":    len([t for t in trades if t.get("outcome") == "unmatched"]),
+        "win_rate":     round(win_rate, 1),
+        "total_net":    round(total_net, 4),
+        "total_gross":  round(total_gross, 4),
+        "total_fees":   round(total_fees, 6),
+        "total_stake":  round(total_stake, 2),
+        "roi":          round(total_net / total_stake * 100, 2) if total_stake else 0.0,
+        "streak":       streak,
+        "streak_type":  stype,
+        "best":         round((best["net_profit"]  or 0) if best  else 0, 4),
+        "worst":        round((worst["net_profit"] or 0) if worst else 0, 4),
+        "equity":       equity,
+        "daily":        daily_list,
+        "latest_bal":   latest_bal,
+        "next_stake":   next_stake,
+        "pending_redeem": pending_redeem,
     }
 
 # ── HTML helpers ───────────────────────────────────────────────────────────────
@@ -222,11 +241,12 @@ def _fmt_pnl(v, dec=4):
     return f'<span class="{cls}">{sgn}{v:.{dec}f}</span>'
 
 def _badge(outcome, skip_reason=""):
-    if outcome == "win":       return '<span class="badge win">WIN</span>'
-    if outcome == "loss":      return '<span class="badge loss">LOSS</span>'
-    if outcome == "stop_loss": return '<span class="badge stop">STOP</span>'
-    if outcome == "open":      return '<span class="badge open">OPEN</span>'
-    if outcome == "unmatched": return '<span class="badge nobadge">NO FILL</span>'
+    if outcome == "win":          return '<span class="badge win">WIN</span>'
+    if outcome == "loss":         return '<span class="badge loss">LOSS</span>'
+    if outcome == "stop_loss":    return '<span class="badge stop">STOP</span>'
+    if outcome == "brutal_sell":  return '<span class="badge brutal">⚡ BRUTAL</span>'
+    if outcome == "open":         return '<span class="badge open">OPEN</span>'
+    if outcome == "unmatched":    return '<span class="badge nobadge">NO FILL</span>'
     if outcome == "skip":
         r = (skip_reason or "skip").replace("_"," ").upper()
         return f'<span class="badge skip">{_esc(r)}</span>'
@@ -237,9 +257,10 @@ def build_page(trades):
     trades = [t for t in trades if isinstance(t, dict)]
     s      = compute_stats(trades)
 
-    # Balance display
-    bal        = s["latest_bal"]
     next_stake = s["next_stake"]
+
+    # Balance display
+    bal = s["latest_bal"]
     if bal is None:
         bal_disp, bal_cls, bal_note = "—", "dim", "No settled trades yet"
     elif bal == 0:
@@ -247,7 +268,8 @@ def build_page(trades):
     elif bal < next_stake:
         bal_disp, bal_cls, bal_note = f"${bal:.2f}", "warning", f"Below ${next_stake:.2f} stake — top up to resume"
     else:
-        bal_disp, bal_cls, bal_note = f"${bal:.2f}", "ok", f"Ready · next stake ${next_stake:.4f}"
+        redeem_note = " · ⏳ Redeem pending" if s["pending_redeem"] else ""
+        bal_disp, bal_cls, bal_note = f"${bal:.2f}", "ok", f"Ready · next stake ${next_stake:.4f}{redeem_note}"
 
     # Nav pill
     if bal is None:
@@ -265,23 +287,28 @@ def build_page(trades):
         alert = '<div class="alert alert-danger">⚠ Balance is zero — top up USDC to resume trading.</div>'
     elif bal is not None and bal < next_stake:
         alert = f'<div class="alert alert-warn">⚠ Balance <strong>${bal:.2f}</strong> is below the ${next_stake:.4f} compound stake. Top up USDC to resume.</div>'
+    elif s["pending_redeem"]:
+        alert = '<div class="alert alert-info">⏳ Win redeem in-flight — USDC not yet confirmed on-chain. Next trade is paused until funds arrive.</div>'
 
-    # Breakdown bar
+    # Breakdown bar — includes brutal_sell as distinct orange-red slice
     total = s["total"]
     if total > 0:
-        wp = s["wins"]   / total * 100
-        lp = s["losses"] / total * 100
-        sp = s["stops"]  / total * 100
+        wp  = s["wins"]    / total * 100
+        lp  = s["losses"]  / total * 100
+        sp  = s["stops"]   / total * 100
+        bp  = s["brutals"] / total * 100
         breakdown = (
             f'<div class="breakdown-bar">'
-            f'<div class="bb-win"  style="width:{wp:.1f}%" title="{s["wins"]} wins ({wp:.1f}%)"></div>'
-            f'<div class="bb-loss" style="width:{lp:.1f}%" title="{s["losses"]} losses ({lp:.1f}%)"></div>'
-            f'<div class="bb-stop" style="width:{sp:.1f}%" title="{s["stops"]} stops ({sp:.1f}%)"></div>'
+            f'<div class="bb-win"    style="width:{wp:.1f}%" title="{s["wins"]} wins ({wp:.1f}%)"></div>'
+            f'<div class="bb-loss"   style="width:{lp:.1f}%" title="{s["losses"]} losses ({lp:.1f}%)"></div>'
+            f'<div class="bb-stop"   style="width:{sp:.1f}%" title="{s["stops"]} stops ({sp:.1f}%)"></div>'
+            f'<div class="bb-brutal" style="width:{bp:.1f}%" title="{s["brutals"]} brutal sells ({bp:.1f}%)"></div>'
             f'</div>'
             f'<div class="breakdown-legend">'
             f'<span class="bl-win">■ {s["wins"]} Wins ({wp:.1f}%)</span>'
             f'<span class="bl-loss">■ {s["losses"]} Losses ({lp:.1f}%)</span>'
             f'<span class="bl-stop">■ {s["stops"]} Stops ({sp:.1f}%)</span>'
+            f'<span class="bl-brutal">⚡ {s["brutals"]} Brutal ({bp:.1f}%)</span>'
             f'<span class="bl-dim">{s["skipped"]} Skipped · {s["unmatched"]} No Fill · {s["open"]} Open</span>'
             f'</div>'
         )
@@ -290,8 +317,9 @@ def build_page(trades):
 
     # Streak
     if s["streak"]:
-        icon = "🔥" if s["streak_type"] == "win" else "🧊"
-        streak_disp = f'{icon} {s["streak"]} {s["streak_type"].upper()} streak'
+        stype = s["streak_type"]
+        icon  = "🔥" if stype == "win" else ("⚡" if stype == "brutal_sell" else "🧊")
+        streak_disp = f'{icon} {s["streak"]} {stype.replace("_"," ").upper()} streak'
     else:
         streak_disp = "—"
 
@@ -353,39 +381,49 @@ def build_page(trades):
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    # IST trading block status
+    utc_now = datetime.utcnow()
+    utc_min = utc_now.hour * 60 + utc_now.minute
+    ist_blocked = utc_min >= 19*60+30 or utc_min < 2*60+30
+    ist_status  = "🔴 BLOCKED (01:00–08:00 IST)" if ist_blocked else "🟢 Active"
+
     return _HTML.format(
-        status_cls   = pclass,
-        status_txt   = ptxt,
-        alert        = alert,
-        bal_disp     = bal_disp,
-        bal_cls      = bal_cls,
-        bal_note     = bal_note,
-        net_disp     = net_disp,
-        net_cls      = net_cls,
-        roi_disp     = roi_disp,
-        roi_cls      = roi_cls,
-        total_stake  = f'{s["total_stake"]:.2f}',
-        win_rate     = f'{s["win_rate"]:.1f}%',
-        wr_cls       = wr_cls,
-        wins         = s["wins"],
-        losses       = s["losses"],
-        stops        = s["stops"],
-        total_trades = s["total"],
-        skipped      = s["skipped"],
-        open_c       = s["open"],
-        best         = ("+" if s["best"] >= 0 else "") + f'{s["best"]:.4f}',
-        worst        = f'{s["worst"]:.4f}',
-        total_fees   = f'{s["total_fees"]:.5f}',
-        streak_disp  = streak_disp,
-        breakdown    = breakdown,
-        equity_json  = json.dumps(s["equity"]),
-        daily_json   = json.dumps(s["daily"]),
-        table_rows   = rows,
-        table_count  = table_count,
-        last_upd     = now,
-        stake        = f'{STAKE:.2f}',
-        next_stake   = f'{next_stake:.4f}',
+        status_cls     = pclass,
+        status_txt     = ptxt,
+        alert          = alert,
+        bal_disp       = bal_disp,
+        bal_cls        = bal_cls,
+        bal_note       = bal_note,
+        net_disp       = net_disp,
+        net_cls        = net_cls,
+        roi_disp       = roi_disp,
+        roi_cls        = roi_cls,
+        total_stake    = f'{s["total_stake"]:.2f}',
+        win_rate       = f'{s["win_rate"]:.1f}%',
+        wr_cls         = wr_cls,
+        wins           = s["wins"],
+        losses         = s["losses"],
+        stops          = s["stops"],
+        brutals        = s["brutals"],
+        total_trades   = s["total"],
+        skipped        = s["skipped"],
+        open_c         = s["open"],
+        best           = ("+" if s["best"] >= 0 else "") + f'{s["best"]:.4f}',
+        worst          = f'{s["worst"]:.4f}',
+        total_fees     = f'{s["total_fees"]:.5f}',
+        streak_disp    = streak_disp,
+        breakdown      = breakdown,
+        equity_json    = json.dumps(s["equity"]),
+        daily_json     = json.dumps(s["daily"]),
+        table_rows     = rows,
+        table_count    = table_count,
+        last_upd       = now,
+        stake          = f'{STAKE:.2f}',
+        next_stake     = f'{next_stake:.4f}',
         next_stake_cls = "green" if next_stake > STAKE else "dim",
+        ist_status     = ist_status,
+        btc_distance   = "40",
+        brutal_thresh  = "93",
     )
 
 
@@ -504,6 +542,7 @@ body{{font-family:var(--sans);background:var(--bg);color:var(--txt);min-height:1
 .alert{{padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:16px;line-height:1.5}}
 .alert-danger{{background:var(--red-bg);border:1px solid var(--red-bdr);color:#fca5a5}}
 .alert-warn  {{background:var(--amber-bg);border:1px solid var(--amber-bdr);color:#fcd34d}}
+.alert-info  {{background:var(--blue-bg);border:1px solid var(--blue-bdr);color:#93c5fd}}
 
 /* ── Summary row ── */
 .summary-row{{display:grid;grid-template-columns:repeat(4,1fr) 2fr;gap:12px;margin-bottom:12px}}
@@ -554,9 +593,11 @@ body{{font-family:var(--sans);background:var(--bg);color:var(--txt);min-height:1
 .bb-win {{background:var(--green);transition:width .6s ease}}
 .bb-loss{{background:var(--red);  transition:width .6s ease}}
 .bb-stop{{background:var(--amber);transition:width .6s ease}}
+.bb-brutal{{background:#f97316;transition:width .6s ease}}
 .breakdown-legend{{display:flex;gap:20px;flex-wrap:wrap}}
 .breakdown-legend span{{font-family:var(--mono);font-size:11px}}
-.bl-win {{color:var(--green)}}.bl-loss{{color:var(--red)}}.bl-stop{{color:var(--amber)}}.bl-dim{{color:var(--dim)}}
+.bl-win {{color:var(--green)}}.bl-loss{{color:var(--red)}}.bl-stop{{color:var(--amber)}}
+.bl-brutal{{color:#f97316}}.bl-dim{{color:var(--dim)}}
 .no-data-note{{font-family:var(--mono);font-size:12px;color:var(--dim)}}
 
 /* ── Table ── */
@@ -585,6 +626,7 @@ tbody tr:hover td{{background:rgba(59,130,246,.04);color:var(--txt)}}
 .badge.win    {{background:var(--green-bg); color:var(--green);border:1px solid var(--green-bdr)}}
 .badge.loss   {{background:var(--red-bg);   color:var(--red);  border:1px solid var(--red-bdr)}}
 .badge.stop   {{background:var(--amber-bg); color:var(--amber);border:1px solid var(--amber-bdr)}}
+.badge.brutal {{background:rgba(249,115,22,.15);color:#f97316;border:1px solid rgba(249,115,22,.4)}}
 .badge.open   {{background:var(--blue-bg);  color:var(--blue); border:1px solid var(--blue-bdr)}}
 .badge.skip   {{background:rgba(71,85,105,.1);color:#94a3b8;border:1px solid var(--b1);font-size:9px}}
 .badge.nobadge{{background:rgba(71,85,105,.1);color:var(--dim);border:1px solid var(--b1);font-size:9px}}
@@ -628,7 +670,7 @@ tbody tr:hover td{{background:rgba(59,130,246,.04);color:var(--txt)}}
     <div class="scard">
       <div class="scard-lbl">Win Rate</div>
       <div class="scard-val {wr_cls}">{win_rate}</div>
-      <div class="scard-note">{wins}W / {losses}L / {stops} Stop</div>
+      <div class="scard-note">{wins}W / {losses}L / {stops} Stop / {brutals} Brutal</div>
     </div>
     <div class="chart-card">
       <div class="ch-head">
@@ -645,7 +687,7 @@ tbody tr:hover td{{background:rgba(59,130,246,.04);color:var(--txt)}}
     <div class="kpi">
       <div class="kpi-lbl">Total Settled</div>
       <div class="kpi-val">{total_trades}</div>
-      <div class="kpi-sub">{wins} wins · {losses} losses · {stops} stops</div>
+      <div class="kpi-sub">{wins} wins · {losses} losses · {stops} stops · {brutals} brutal</div>
     </div>
     <div class="kpi">
       <div class="kpi-lbl">Skipped / No Fill</div>
@@ -676,6 +718,41 @@ tbody tr:hover td{{background:rgba(59,130,246,.04);color:var(--txt)}}
       <div class="kpi-lbl">Total Fees</div>
       <div class="kpi-val" style="font-size:16px">${total_fees}</div>
       <div class="kpi-sub">cumulative USDC</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-lbl">⚡ Brutal Sells</div>
+      <div class="kpi-val" style="color:#f97316">{brutals}</div>
+      <div class="kpi-sub">bid dropped ≤ {brutal_thresh}% · capital saved</div>
+    </div>
+  </div>
+
+  <!-- ── Bot Config panel ── -->
+  <div class="sec">Bot Config (v9)</div>
+  <div class="kpi-grid">
+    <div class="kpi">
+      <div class="kpi-lbl">Base Stake</div>
+      <div class="kpi-val dim">${stake}</div>
+      <div class="kpi-sub">USDC per trade</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-lbl">Entry Threshold</div>
+      <div class="kpi-val dim">99%</div>
+      <div class="kpi-sub">ask must be ≥ 0.99</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-lbl">BTC Distance</div>
+      <div class="kpi-val dim">${btc_distance}</div>
+      <div class="kpi-sub">min gap from opening price</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-lbl">Brutal Sell At</div>
+      <div class="kpi-val" style="color:#f97316">≤ {brutal_thresh}%</div>
+      <div class="kpi-sub">any bid drop to/below threshold</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-lbl">IST Trading Hours</div>
+      <div class="kpi-val" style="font-size:14px">{ist_status}</div>
+      <div class="kpi-sub">paused 01:00–08:00 IST</div>
     </div>
   </div>
 
