@@ -122,7 +122,7 @@ PARENT_COLLECTION_ID = "0x" + ("00" * 32)
 RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RELAYER_URL") or "https://relayer-v2.polymarket.com/"
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-STAKE             = 10.00    # Base stake per trade
+STAKE             = 4.0    # Base stake per trade
 BASE_THRESHOLD    = 0.99    # Buy when dominant side ask >= 99%
 ADAPTIVE_THRESH   = 0.99    # Same threshold even after losses (99% only)
 ENTRY_WINDOW_SEC  = 40      # Enter only in last 30 seconds
