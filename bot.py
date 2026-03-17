@@ -1,7 +1,17 @@
 """
-Polymarket BTC 5-Minute Bot — v8 (anti-reversal filters)
+Polymarket BTC 5-Minute Bot — v9
 
-Changes vs v7:
+Changes vs v8:
+  1. MIN_BTC_DISTANCE reduced from $60 to $40 (more trade opportunities)
+  2. STAKE reduced from $6 to $5
+  3. IST night-hours block: no trades between 01:00–08:00 IST (UTC 19:30–02:30)
+  4. BRUTAL sell logic: if bid drops to <= 93% after entering at 99%, immediately
+     sell everything (multi-attempt aggressive FAK cascade, no price floor retreat)
+  5. Compounding bug fix: compound_base is now updated AFTER redeem confirms (not
+     speculatively). A pending_redeem flag prevents the next trade from firing on
+     a stake we don't yet have in the account.
+
+Changes vs v7 (retained from v8):
   ANTI-REVERSAL / LOSS REDUCTION
   1. get_signal() now checks momentum direction over last MOMENTUM_N (8) ticks:
        - Skips if price has dropped > MAX_DROP_FROM_PEAK (2.5¢) from its recent high
@@ -112,7 +122,7 @@ PARENT_COLLECTION_ID = "0x" + ("00" * 32)
 RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RELAYER_URL") or "https://relayer-v2.polymarket.com/"
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
-STAKE             = 6.00    # Base stake per trade
+STAKE             = 5.00    # Base stake per trade
 BASE_THRESHOLD    = 0.99    # Buy when dominant side ask >= 99%
 ADAPTIVE_THRESH   = 0.99    # Same threshold even after losses (99% only)
 ENTRY_WINDOW_SEC  = 30      # Enter only in last 30 seconds
@@ -129,7 +139,7 @@ MAX_SPREAD        = 0.04    # Skip if bid-ask spread > 4¢
 # Polymarket BTC 5m markets resolve based on Chainlink BTC/USD price.
 # The "Price to Beat" is the Chainlink price at window open (btc_opening_price).
 # We subscribe to Polymarket's own RTDS Chainlink feed to track this in real-time.
-MIN_BTC_DISTANCE    = 60.0  # live BTC must be >= $60 away from opening price in bet direction
+MIN_BTC_DISTANCE    = 40.0  # live BTC must be >= $40 away from opening price in bet direction
 BTC_VOLATILITY_SEC  = 60    # look-back window in seconds to measure BTC volatility
 BTC_MAX_VOLATILITY  = 150.0 # skip if BTC high-low range > $150 in last 60s (too choppy)
 
@@ -148,6 +158,19 @@ OSCILLATION_BAD_SWINGS  = 2      # skip if >= this many BAD reverse ticks found
 # Effective threshold = base/adaptive threshold + LATE_ENTRY_SURCHARGE.
 LATE_ENTRY_MAX_T     = 3     # seconds from close where tightening kicks in
 LATE_ENTRY_SURCHARGE = 0.01  # add 1¢ to required ask when time_left < LATE_ENTRY_MAX_T
+
+# ── IST trading hours block ────────────────────────────────────────────────────
+# No trades between 01:00 and 08:00 IST (Indian Standard Time = UTC+5:30).
+# In UTC that is: 19:30 (prev day) to 02:30.
+# We store as (hour, minute) tuples in UTC.
+IST_BLOCK_START_UTC = (19, 30)   # 01:00 IST = 19:30 UTC
+IST_BLOCK_END_UTC   = ( 2, 30)   # 08:00 IST = 02:30 UTC  (crosses midnight)
+
+# ── Brutal sell trigger ────────────────────────────────────────────────────────
+# If the market bid drops at or below this level AFTER we enter at 99%,
+# immediately sell EVERYTHING as aggressively as possible (price floor = 0.01).
+# Goal: cut losses hard and fast rather than riding a reversal to zero.
+BRUTAL_SELL_THRESHOLD = 0.93   # 93% — triggers brutal exit if bid <= this level
 
 TRADES_FILE = Path("trades.json")
 
@@ -245,6 +268,12 @@ class BotState:
     btc_opening_price: float      = 0.0
     btc_live_price: float         = 0.0
     btc_price_history: list       = field(default_factory=list)  # (ts, price) pairs
+    # ── Compounding fix: pending redeem guard ──────────────────────────────────
+    # Set True when a WIN is detected and background redeem is in-flight.
+    # The trading loop checks this: if True, compound_base has already been
+    # bumped speculatively — but the USDC isn't in the account yet.
+    # Trading is blocked until the redeem confirms OR times out, then flag clears.
+    pending_redeem: bool          = False
 
 # ─── Persistence ──────────────────────────────────────────────────────────────
 def load_trades() -> list:
@@ -543,6 +572,23 @@ def enrich_market(client: ClobClient, market: Market) -> Market:
     log.info(f"Market ready: {market.slug} | tick={market.tick_size} fee_bps={market.fee_rate}")
     return market
 
+# ─── IST trading-hours guard ──────────────────────────────────────────────────
+def is_ist_blocked() -> bool:
+    """
+    Returns True if current UTC time falls in the IST night-hours block:
+      01:00–08:00 IST  ==  19:30–02:30 UTC  (spans midnight)
+    No trades should be placed during this window.
+    """
+    now_utc = datetime.utcnow()
+    h, m    = now_utc.hour, now_utc.minute
+    # Convert to minutes-since-midnight for easy comparison
+    cur_min   = h * 60 + m
+    start_min = IST_BLOCK_START_UTC[0] * 60 + IST_BLOCK_START_UTC[1]   # 19*60+30 = 1170
+    end_min   = IST_BLOCK_END_UTC[0]   * 60 + IST_BLOCK_END_UTC[1]     # 2*60+30  = 150
+    # Block spans midnight: blocked if cur >= start OR cur < end
+    return cur_min >= start_min or cur_min < end_min
+
+
 # ─── Signal detection ─────────────────────────────────────────────────────────
 def get_signal(market: Market, history: deque, consecutive_losses: int,
                time_left: int = 999) -> Optional[tuple]:
@@ -768,22 +814,92 @@ async def execute_sell(client: ClobClient, market: Market, position: Position,
         # The 0.5s balance check above is the only delay
 
 
+async def execute_brutal_sell(client: ClobClient, market: Market, position: Position,
+                              clock_offset: float = 0.0) -> Optional[dict]:
+    """
+    BRUTAL sell: sell ALL shares at any price, starting floor=0.01 immediately.
+    No gentle floor-dropping — we go straight to 0.01 on attempt 1.
+    Retries every loop tick until filled, balance confirms, or < 2s remain.
+
+    This is triggered when bid drops to <= 93% (BRUTAL_SELL_THRESHOLD) after
+    entering at 99%. The goal is maximum capital preservation — accept any price,
+    get out NOW.
+    """
+    bal_before = get_balance(client)
+    attempt = 0
+    log.warning(f"  ⚡ BRUTAL SELL — {position.shares:.6f} shares @ floor=0.01 (accept ANY price)")
+
+    while True:
+        attempt += 1
+        now_left = market.end_ts - int(time.time() + clock_offset)
+
+        if now_left <= 2:
+            log.warning(f"  BRUTAL SELL abort: {now_left}s left, market resolving. Attempting one last shot.")
+            # One final attempt even if almost expired
+            try:
+                mo = MarketOrderArgs(token_id=position.token_id, amount=position.shares,
+                                     side=SELL, price=0.01)
+                order = client.create_market_order(mo)
+                resp  = client.post_order(order, OrderType.FAK)
+                log.info(f"  BRUTAL final attempt resp: {resp}")
+            except Exception as e:
+                log.error(f"  BRUTAL final attempt error: {e}")
+            return None
+
+        log.warning(f"  ⚡ BRUTAL attempt {attempt}: {position.shares:.6f} shares @ 0.01 | T-{now_left}s remain")
+        try:
+            mo = MarketOrderArgs(
+                token_id = position.token_id,
+                amount   = position.shares,
+                side     = SELL,
+                price    = 0.01,   # Accept ANYTHING — capital preservation is the only goal
+            )
+            order = client.create_market_order(mo)
+            resp  = client.post_order(order, OrderType.FAK)
+            log.info(f"  BRUTAL resp (attempt {attempt}): {resp}")
+
+            size_matched  = float(resp.get("size_matched",  0) or 0) if resp else 0
+            taking_amount = float(resp.get("takingAmount",  0) or 0) if resp else 0
+            making_amount = float(resp.get("makingAmount",  0) or 0) if resp else 0
+            status        = (resp.get("status", "") or "").lower()   if resp else ""
+
+            if size_matched > 0 or taking_amount > 0 or making_amount > 0 or status == "matched":
+                log.warning(f"  ⚡ BRUTAL SELL FILLED on attempt {attempt}: "
+                            f"status={status} taking={taking_amount} making={making_amount}")
+                return resp
+
+            # Check balance
+            await asyncio.sleep(1.0)
+            bal_now = get_balance(client)
+            if bal_now > bal_before + 0.01:
+                log.warning(f"  ⚡ BRUTAL SELL confirmed via balance: "
+                            f"${bal_before:.4f} → ${bal_now:.4f}")
+                return resp
+
+            log.warning(f"  BRUTAL attempt {attempt} not confirmed — retrying immediately...")
+
+        except Exception as e:
+            log.error(f"  BRUTAL sell attempt {attempt} error: {e}")
+            await asyncio.sleep(0.5)
+
+
 # ─── Stop-loss monitor ────────────────────────────────────────────────────────
-def should_stop_loss(position: Position, history: deque, time_left: int) -> Optional[float]:
+def should_stop_loss(position: Position, history: deque, time_left: int) -> Optional[tuple]:
     """
-    Returns the exit bid price if stop-loss should trigger, else None.
+    Returns (exit_bid, brutal) if stop-loss should trigger, else None.
 
-    Two triggers:
-      1. Hard SL  : current bid < STOP_LOSS_BID (75%) at any time > STOP_LOSS_MIN_SEC
-      2. Fast-drop: bid has dropped >= 5¢ from entry price AND > 15s remain
-         (exit early while there are still buyers, before it crashes to the hard floor)
+      brutal=True  → BRUTAL_SELL_THRESHOLD breached (bid <= 93%): sell at ANY price,
+                     floor starts at 0.01 immediately — maximum aggression.
+      brutal=False → standard soft stop-loss (existing fast-drop or hard-floor logic).
 
-    Uses the median of the last 3 bid ticks to avoid false triggers from a single
-    stale or erroneous WSS tick.
+    Three triggers (checked in priority order):
+      0. BRUTAL    : bid <= BRUTAL_SELL_THRESHOLD (93%) after entering at 99%.
+                     Ignores STOP_LOSS_MIN_SEC — fires even close to expiry.
+      1. Hard SL   : bid < STOP_LOSS_BID (85%) at any time > STOP_LOSS_MIN_SEC.
+      2. Fast-drop : bid has dropped >= 5¢ from entry AND > 15s remain.
+
+    Uses the median of the last 3 bid ticks to filter stale/noisy WSS ticks.
     """
-    if time_left <= STOP_LOSS_MIN_SEC:
-        return None
-
     bids = [t.best_bid for t in history if t.token_id == position.token_id]
     if not bids:
         return None
@@ -794,12 +910,26 @@ def should_stop_loss(position: Position, history: deque, time_left: int) -> Opti
         return None
     current_bid = statistics.median(recent)
 
-    # Hard stop-loss
+    # ── Trigger 0: BRUTAL sell (93% floor breach) ─────────────────────────────
+    # Only applies if entry was at 99%+ (we only ever enter at 99%, but guard anyway).
+    # Fires regardless of time_left — every second counts when reversing hard.
+    if position.entry_price >= BASE_THRESHOLD and current_bid <= BRUTAL_SELL_THRESHOLD:
+        log.warning(
+            f"  ⚡ BRUTAL SELL triggered: bid={current_bid:.4f} <= {BRUTAL_SELL_THRESHOLD} "
+            f"(entry={position.entry_price:.4f}) | T-{time_left}s remain"
+        )
+        return current_bid, True
+
+    # Standard triggers only fire if enough time remains
+    if time_left <= STOP_LOSS_MIN_SEC:
+        return None
+
+    # ── Trigger 1: Hard stop-loss ─────────────────────────────────────────────
     if current_bid < STOP_LOSS_BID:
         log.info(f"  Hard stop-loss: bid={current_bid:.4f} < {STOP_LOSS_BID}")
-        return current_bid
+        return current_bid, False
 
-    # Fast-drop stop-loss: 5¢ drop from entry with >15s to sell
+    # ── Trigger 2: Fast-drop stop-loss ───────────────────────────────────────
     if time_left > 15:
         drop_from_entry = position.entry_price - current_bid
         if drop_from_entry >= 0.05:
@@ -807,7 +937,7 @@ def should_stop_loss(position: Position, history: deque, time_left: int) -> Opti
                 f"  Fast-drop stop-loss: entry={position.entry_price:.4f} "
                 f"bid={current_bid:.4f} drop={drop_from_entry:.4f}"
             )
-            return current_bid
+            return current_bid, False
 
     return None
 
@@ -1084,6 +1214,13 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
             state.exchange_disabled = False
             continue
 
+        # ── IST Night-hours block (01:00–08:00 IST = 19:30–02:30 UTC) ────────
+        if is_ist_blocked():
+            now_utc = datetime.utcnow()
+            log.info(f"[IST BLOCK] No trading 01:00–08:00 IST (UTC now={now_utc.strftime('%H:%M')}) — sleeping 60s")
+            await asyncio.sleep(60)
+            continue
+
         if not state.market:
             # Poll for market every 15s — don't rely solely on WSS new_market event
             now = int(time.time())
@@ -1150,9 +1287,10 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
 
         # ── OPEN POSITION: monitor for stop-loss or resolution ─────────────
         if state.position is not None:
-            exit_bid = should_stop_loss(state.position, state.price_history, time_left)
-            if exit_bid is not None:
-                await _do_stop_loss(client, session, state, exit_bid)
+            sl_result = should_stop_loss(state.position, state.price_history, time_left)
+            if sl_result is not None:
+                exit_bid, is_brutal = sl_result
+                await _do_stop_loss(client, session, state, exit_bid, brutal=is_brutal)
                 # Only advance if position was actually cleared (sell succeeded).
                 # If sell failed, _do_stop_loss leaves state.position intact so we
                 # keep monitoring and the redeem at close will handle it.
@@ -1224,7 +1362,11 @@ async def trading_loop(client: ClobClient, session: aiohttp.ClientSession,
                 # Do NOT set trade_fired — keep trying until MIN_FIRE_BUFFER
                 continue
 
-            # Gate 4: balance
+            # Gate 4: balance — also block if a win redeem is still in-flight
+            # (compound_base was bumped but USDC not yet in account)
+            if state.pending_redeem:
+                log.info(f"  T-{time_left}s: pending redeem in-flight — waiting for USDC before next trade...")
+                continue
             bal = get_balance(client)
             state.last_balance = bal
             if bal < state.current_stake:
@@ -1963,39 +2105,36 @@ async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, 
     """
     Called when WSS market_resolved fires.
     Determines win/loss, saves the trade record, then launches a background
-    redemption task that waits for the prize to become available on-chain
-    (typically 2-3 min after resolution) and keeps polling every 5 seconds
-    until the redeem succeeds or 10 minutes elapses.
+    redemption task. Compounding is updated ONLY after redeem confirms to prevent
+    the next trade from firing on stake we don't yet have in the account.
     """
     pos  = state.position
     won  = (state.resolved == pos.token_id)
     outcome = "win" if won else "loss"
     fee_bps = float(state.market.fee_rate or 0)
-    # Use the actual stake that was placed (pos.stake), not the global STAKE constant
     trade_stake = pos.stake if pos.stake and pos.stake > 0 else state.current_stake
     payout, gross, fee_usdc, net = calc_profit(trade_stake, pos.entry_price, 1.0, fee_bps, outcome)
 
     bal_before = state.last_balance
     if won:
-        state.consecutive_wins  += 1
+        state.consecutive_wins += 1
         if state.consecutive_wins >= 5:
             state.consecutive_losses = 0
             state.consecutive_wins   = 0
             log.info("[STREAK] 5 consecutive wins — adaptive threshold reset to base.")
-        # ── Compounding: grow the intended base by net profit ──────────────
-        # compound_base is the INTENDED stake — never corrupted by partial fills.
-        # We compound on this, not on pos.stake (actual filled amount).
-        state.last_net_profit  = net
-        state.compound_base    = round(state.compound_base + net, 4)
-        state.current_stake    = state.compound_base
-        log.info(f"[COMPOUND] WIN — compound_base: ${state.compound_base:.4f} (prev + ${net:.4f} profit)")
+        # ── Compounding FIX: set pending_redeem=True and store expected net profit.
+        # compound_base is NOT updated yet — we wait until _background_redeem
+        # confirms USDC arrived. This prevents trading on phantom balance.
+        state.last_net_profit = net
+        state.pending_redeem  = True
+        log.info(f"[COMPOUND] WIN detected — pending redeem. Will compound +${net:.4f} after USDC confirmed.")
     else:
         state.consecutive_losses += 1
         state.consecutive_wins   = 0
-        # ── Compounding: reset both to BASE_STAKE on loss ────────────────
-        state.last_net_profit = 0.0
-        state.compound_base   = STAKE
-        state.current_stake   = STAKE
+        state.last_net_profit    = 0.0
+        state.compound_base      = STAKE
+        state.current_stake      = STAKE
+        state.pending_redeem     = False
         log.info(f"[COMPOUND] LOSS — stake reset to base ${STAKE:.2f}")
 
     log.info(f"{'WIN ✅' if won else 'LOSS ❌'}: gross={gross:+.4f} fee={fee_usdc:.5f} net={net:+.4f}")
@@ -2004,14 +2143,18 @@ async def _resolve_position(client: ClobClient, session: aiohttp.ClientSession, 
         cid = pos.market.condition_id
         if cid:
             log.info(f"[REDEEM] WIN detected — launching background redemption task for {cid[:20]}...")
-            # Fire-and-forget: does NOT block the trading loop from advancing
             asyncio.create_task(
                 _background_redeem(session, client, state, cid, pos, gross, fee_usdc, net, bal_before)
             )
         else:
             log.warning("[REDEEM] WIN but condition_id is empty — cannot auto-redeem.")
+            # No redeem possible — apply compounding now with current balance
             bal_after = get_balance(client)
-            state.last_balance = bal_after
+            state.last_balance   = bal_after
+            state.compound_base  = round(state.compound_base + net, 4)
+            state.current_stake  = state.compound_base
+            state.pending_redeem = False
+            log.info(f"[COMPOUND] Applied immediately (no CID): compound_base=${state.compound_base:.4f}")
             _save_resolved_trade(pos, outcome, payout, gross, fee_usdc, net, bal_before, bal_after)
     else:
         bal_after = get_balance(client)
@@ -2069,6 +2212,13 @@ async def _background_redeem(
 
         if gained > 0.01:
             log.info(f"[REDEEM] ✅ CLAIMED! ${bal_snapshot:.4f} → ${bal_now:.4f} (+${gained:.4f})")
+            # ── COMPOUNDING: apply NOW that USDC is confirmed in account ─────
+            # This is the only safe place — we know the money is actually there.
+            state.compound_base  = round(state.compound_base + net, 4)
+            state.current_stake  = state.compound_base
+            state.pending_redeem = False
+            log.info(f"[COMPOUND] ✅ CONFIRMED — compound_base=${state.compound_base:.4f} "
+                     f"(+${net:.4f} net profit after redeem)")
             # NOW update state — this is the only safe place to do it
             state.last_balance = bal_now
             _save_resolved_trade(pos, "win", gained, gross, fee_usdc, net, bal_before, bal_now)
@@ -2115,17 +2265,27 @@ async def _background_redeem(
     # Hard timeout
     bal_final    = get_balance(client)
     gained_final = bal_final - bal_snapshot
-    state.last_balance = bal_final
+    state.last_balance   = bal_final
+    state.pending_redeem = False  # always clear — whether we got money or not
     if gained_final <= 0.01:
         # Cascade never succeeded — remove from seen set so redeem_loop can retry
         state.redeemed_condition_ids.discard(condition_id)
+        # Compounding was deferred — apply anyway so next trade uses correct stake
+        # (The money WILL arrive eventually via redeem_loop, just not confirmed yet)
+        state.compound_base = round(state.compound_base + net, 4)
+        state.current_stake = state.compound_base
         log.warning(
             f"[REDEEM] ⚠️ 10-min timeout, no USDC received. Handing off to redeem_loop for retry.\n"
+            f"         compound_base tentatively updated to ${state.compound_base:.4f}.\n"
             f"         Condition ID: {condition_id}"
         )
     else:
+        # USDC arrived during timeout window — apply compounding now
+        state.compound_base = round(state.compound_base + net, 4)
+        state.current_stake = state.compound_base
         log.warning(
             f"[REDEEM] ⚠️ 10-min timeout but USDC arrived: gained=${gained_final:.4f}.\n"
+            f"         compound_base=${state.compound_base:.4f}\n"
             f"         Condition ID: {condition_id}"
         )
     _save_resolved_trade(pos, "win", gained_final, gross, fee_usdc, net, bal_before, bal_final)
@@ -2142,17 +2302,28 @@ def _save_resolved_trade(pos, outcome, payout, gross, fee_usdc, net, bal_before,
         market_slug=pos.market.slug, timestamp=_ts(),
     ))
 async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
-                        state: BotState, exit_bid: float):
-    """Execute a stop-loss SELL. Only clears position if sell actually filled."""
+                        state: BotState, exit_bid: float, brutal: bool = False):
+    """
+    Execute a stop-loss SELL. Only clears position if sell actually filled.
+
+    brutal=True  → use execute_brutal_sell (price floor=0.01, maximum aggression,
+                   fires even with <5s remain). Triggered at <= 93% bid.
+    brutal=False → use execute_sell (gentler floor-dropping approach).
+    """
     pos = state.position
+    mode_label = "⚡ BRUTAL" if brutal else "STOP-LOSS"
 
     # Always fetch a fresh balance right before selling — state.last_balance
     # may be stale from the original buy and cause false "fill failed" detection.
     bal_before = get_balance(client)
     state.last_balance = bal_before
 
-    resp = await execute_sell(client, state.market, pos, exit_bid,
-                              clock_offset=state.clock_offset)
+    if brutal:
+        resp = await execute_brutal_sell(client, state.market, pos,
+                                         clock_offset=state.clock_offset)
+    else:
+        resp = await execute_sell(client, state.market, pos, exit_bid,
+                                  clock_offset=state.clock_offset)
 
     # Determine if fill succeeded: check size_matched first, then balance delta
     size_matched = float(resp.get("size_matched", 0)) if resp else 0
@@ -2163,30 +2334,34 @@ async def _do_stop_loss(client: ClobClient, session: aiohttp.ClientSession,
 
     if not filled:
         log.error(
-            f"  ❌ STOP-LOSS SELL FAILED after all retries. "
+            f"  ❌ {mode_label} SELL FAILED after all retries. "
             f"bal_before=${bal_before:.4f} bal_after=${bal_after:.4f}. "
             f"Position kept open — will resolve at market close."
         )
         return  # do NOT clear position — redeem at close will handle it
 
-    actual_exit = exit_bid
+    actual_exit = bal_after - bal_before if bal_after > bal_before else exit_bid
+    # Use the actual per-share exit price for record keeping
+    actual_exit_price = min(actual_exit / pos.shares, 1.0) if pos.shares > 0 else exit_bid
     fee_bps = float(state.market.fee_rate or 0)
     trade_stake = pos.stake if pos.stake and pos.stake > 0 else state.current_stake
-    payout, gross, fee_usdc, net = calc_profit(trade_stake, pos.entry_price, actual_exit, fee_bps, "stop_loss")
+    payout, gross, fee_usdc, net = calc_profit(trade_stake, pos.entry_price, actual_exit_price, fee_bps, "stop_loss")
     state.consecutive_losses += 1
     state.consecutive_wins   = 0
-    # ── Compounding: reset both to BASE_STAKE on stop-loss ───────────────────
+    # ── Compounding: reset both to BASE_STAKE on any stop-loss ───────────────
     state.last_net_profit = 0.0
     state.compound_base   = STAKE
     state.current_stake   = STAKE
-    log.info(f"[COMPOUND] STOP-LOSS — stake reset to base ${STAKE:.2f}")
+    state.pending_redeem  = False  # clear any stale flag
+    log.info(f"[COMPOUND] {mode_label} — stake reset to base ${STAKE:.2f}")
 
-    log.info(f"✅ STOP-LOSS executed: entry={pos.entry_price:.4f} exit={actual_exit:.4f} | "
+    log.info(f"✅ {mode_label} executed: entry={pos.entry_price:.4f} exit≈{actual_exit_price:.4f} | "
              f"gross={gross:+.4f} net={net:+.4f} | balance ${bal_before:.4f} → ${bal_after:.4f}")
     save_trade(TradeRecord(
         cycle_id=pos.cycle_id, side=pos.side, entry_price=pos.entry_price,
-        exit_price=actual_exit, shares_held=pos.shares, stake=trade_stake,
-        outcome="stop_loss", payout=payout, gross_profit=gross,
+        exit_price=actual_exit_price, shares_held=pos.shares, stake=trade_stake,
+        outcome="brutal_sell" if brutal else "stop_loss",
+        payout=payout, gross_profit=gross,
         fee_usdc=fee_usdc, net_profit=net,
         balance_before=bal_before, balance_after=bal_after,
         market_slug=pos.market.slug, timestamp=_ts(),
@@ -2394,11 +2569,13 @@ async def run_bot():
         loop.add_signal_handler(sig, stop.set)
 
     log.info("=" * 65)
-    log.info(" Polymarket BTC 5m Bot — Compounding | 99% | Chainlink distance+volatility filter")
-    log.info(f" Stake: base=${STAKE:.2f} | compounds on WIN, resets on LOSS/STOP-LOSS")
+    log.info(" Polymarket BTC 5m Bot — v9 | Compounding | 99% | Chainlink")
+    log.info(f" Stake: base=${STAKE:.2f} | compounds AFTER redeem confirms")
     log.info(f" Buy: >= {BASE_THRESHOLD*100:.0f}% | entry window T-{ENTRY_WINDOW_SEC}s | presign T-{PRESIGN_BEFORE}s")
     log.info(f" Stop-loss: sell if bid < {STOP_LOSS_BID*100:.0f}% AND > {STOP_LOSS_MIN_SEC}s remain")
+    log.info(f" BRUTAL SELL: bid <= {BRUTAL_SELL_THRESHOLD*100:.0f}% at any time → sell at ANY price immediately")
     log.info(f" BTC filter: distance >= ${MIN_BTC_DISTANCE:.0f} | volatility <= ${BTC_MAX_VOLATILITY:.0f}/{BTC_VOLATILITY_SEC}s")
+    log.info(f" IST block: no trades 01:00–08:00 IST (19:30–02:30 UTC)")
     log.info(" REDEEM: 3-layer cascade (relayer PROXY → poly-web3 → proxy.forward)")
     log.info("=" * 65)
 
