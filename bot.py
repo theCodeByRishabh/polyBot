@@ -139,7 +139,7 @@ MAX_SPREAD        = 0.04    # Skip if bid-ask spread > 4¢
 # Polymarket BTC 5m markets resolve based on Chainlink BTC/USD price.
 # The "Price to Beat" is the Chainlink price at window open (btc_opening_price).
 # We subscribe to Polymarket's own RTDS Chainlink feed to track this in real-time.
-MIN_BTC_DISTANCE    = 40.0  # live BTC must be >= $40 away from opening price in bet direction
+MIN_BTC_DISTANCE    = 60.0  # live BTC must be >= $40 away from opening price in bet direction
 BTC_VOLATILITY_SEC  = 60    # look-back window in seconds to measure BTC volatility
 BTC_MAX_VOLATILITY  = 150.0 # skip if BTC high-low range > $150 in last 60s (too choppy)
 
