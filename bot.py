@@ -123,13 +123,13 @@ RELAYER_URL     = os.environ.get("POLYMARKET_RELAYER_URL") or os.environ.get("RE
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
 STAKE             = 8.00    # Base stake per trade
-BASE_THRESHOLD    = 0.99    # Buy when dominant side ask >= 99%
+BASE_THRESHOLD    = 0.98    # Buy when dominant side ask >= 99%
 ADAPTIVE_THRESH   = 0.99    # Same threshold even after losses (99% only)
 ENTRY_WINDOW_SEC  = 40      # Enter only in last 30 seconds
-PRESIGN_BEFORE    = 40      # Build signed order at T-40s (ready for T-30s window)
-MIN_FIRE_BUFFER   = 5       # Never fire if < 5s remain (too risky)
-STOP_LOSS_BID     = 0.85    # Exit position if best_bid falls below this
-STOP_LOSS_MIN_SEC = 5       # Don't stop-loss if < 5s remain (just let it resolve)
+PRESIGN_BEFORE    = 50      # Build signed order at T-40s (ready for T-30s window)
+MIN_FIRE_BUFFER   = 1       # Never fire if < 5s remain (too risky)
+STOP_LOSS_BID     = 0.93    # Exit position if best_bid falls below this
+STOP_LOSS_MIN_SEC = 1       # Don't stop-loss if < 5s remain (just let it resolve)
 STABILITY_N       = 5       # Price ticks needed for stability check
 MAX_STD_DEV       = 0.015   # Max std-dev for stability
 MIN_LIQUIDITY     = 3.0     # Min USDC ask depth
